@@ -44,3 +44,6 @@ ENV/
 # OS files
 .DS_Store
 Thumbs.db
+.claude
+.claude/
+ACTION_PLAN.md
