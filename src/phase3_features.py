@@ -6,7 +6,11 @@ All features are computed per segment (1D numpy array). The module exposes:
 - extract_cas_features()
 - extract_all_features()
 - build_feature_matrix()
+- normalize_amplitude_features_per_subject()
+- extract_labeling_features()
+- build_labeling_feature_matrix()
 - FEATURE_NAMES
+- LABELING_FEATURE_NAMES
 """
 
 from __future__ import annotations
@@ -42,15 +46,15 @@ NEIGHBOURHOOD_HZ: float = 50.0  # Hz half-width around dominant peak
 # Feature name registry (must match extraction order)
 # ---------------------------------------------------------------------------
 
+# ML feature matrix — 16 features (circular labeling features excluded)
 FEATURE_NAMES: list[str] = [
-    # Temporal (6)
+    # Temporal (5)
     "rms",
     "zero_crossing_rate",
     "kurtosis",
     "skewness",
-    "duration_s",
     "peak_to_peak",
-    # Spectral (9)
+    # Spectral (8)
     "mean_freq",
     "median_freq",
     "peak_freq",
@@ -59,39 +63,22 @@ FEATURE_NAMES: list[str] = [
     "band_power_200_500",
     "band_power_500_1000",
     "band_power_1000_1900",
-    "spectral_flatness",
-    # CAS-specific (5)
-    "n_spectral_peaks_100_1000",
+    # CAS-specific (3)
     "peak_sharpness",
     "autocorr_peak",
     "harmonic_ratio",
-    "spectral_flatness_cas",  # kept for internal use; primary is in spectral block
 ]
 
-# Re-define without duplicate so FEATURE_NAMES has unique entries for matrix shape
-FEATURE_NAMES = [
-    "rms",
-    "zero_crossing_rate",
-    "kurtosis",
-    "skewness",
+N_FEATURES: int = len(FEATURE_NAMES)  # 16
+
+# Labeling-only features — used exclusively by make_rule_based_labels().
+# These are NOT in the ML feature matrix to prevent circular label/feature dependency.
+LABELING_FEATURE_NAMES: list[str] = [
+    "spectral_flatness",
+    "n_spectral_peaks_100_1000",
     "duration_s",
-    "peak_to_peak",
-    "mean_freq",
-    "median_freq",
-    "peak_freq",
-    "spectral_entropy",
-    "band_power_70_200",
-    "band_power_200_500",
-    "band_power_500_1000",
-    "band_power_1000_1900",
-    "spectral_flatness",
-    "n_spectral_peaks_100_1000",
-    "peak_sharpness",
-    "autocorr_peak",
-    "harmonic_ratio",
+    "max_peak_prominence_frac",
 ]
-
-N_FEATURES: int = len(FEATURE_NAMES)  # 19
 
 
 # ---------------------------------------------------------------------------
@@ -100,14 +87,14 @@ N_FEATURES: int = len(FEATURE_NAMES)  # 19
 
 
 def extract_temporal_features(signal: np.ndarray, fs: int = FS_TARGET) -> np.ndarray:
-    """Compute 6 temporal features for a 1D signal segment.
+    """Compute 5 temporal features for a 1D signal segment.
 
     Args:
         signal: 1D numpy array.
         fs: Sample rate in Hz.
 
     Returns:
-        1D array of length 6: [rms, zcr, kurtosis, skewness, duration_s, peak_to_peak].
+        1D array of length 5: [rms, zcr, kurtosis, skewness, peak_to_peak].
 
     Raises:
         ValueError: If signal is not 1D or is empty.
@@ -117,22 +104,20 @@ def extract_temporal_features(signal: np.ndarray, fs: int = FS_TARGET) -> np.nda
     zcr = float(np.sum(np.diff(np.sign(signal)) != 0) / len(signal))
     kurt = float(scipy.stats.kurtosis(signal))
     skew = float(scipy.stats.skew(signal))
-    duration_s = float(len(signal) / fs)
     ptp = float(np.ptp(signal))
-    return np.array([rms, zcr, kurt, skew, duration_s, ptp], dtype=np.float64)
+    return np.array([rms, zcr, kurt, skew, ptp], dtype=np.float64)
 
 
 def extract_spectral_features(signal: np.ndarray, fs: int = FS_TARGET) -> np.ndarray:
-    """Compute 9 spectral features using Welch's PSD estimate.
+    """Compute 8 spectral features using Welch's PSD estimate.
 
     Args:
         signal: 1D numpy array.
         fs: Sample rate in Hz.
 
     Returns:
-        1D array of length 9: [mean_freq, median_freq, peak_freq, spectral_entropy,
-        band_power_70_200, band_power_200_500, band_power_500_1000,
-        band_power_1000_1900, spectral_flatness].
+        1D array of length 8: [mean_freq, median_freq, peak_freq, spectral_entropy,
+        band_power_70_200, band_power_200_500, band_power_500_1000, band_power_1000_1900].
 
     Raises:
         ValueError: If signal is not 1D or is empty.
@@ -157,25 +142,22 @@ def extract_spectral_features(signal: np.ndarray, fs: int = FS_TARGET) -> np.nda
     bp_500_1000 = _band_power_fraction(freqs, psd, BAND_HIGH_LOW, BAND_HIGH_HIGH, total_power)
     bp_1000_1900 = _band_power_fraction(freqs, psd, BAND_VHIGH_LOW, BAND_VHIGH_HIGH, total_power)
 
-    flatness = float(scipy.stats.gmean(psd + 1e-12) / np.mean(psd + 1e-12))
-
     return np.array(
         [mean_f, median_f, peak_f, entropy, bp_70_200, bp_200_500,
-         bp_500_1000, bp_1000_1900, flatness],
+         bp_500_1000, bp_1000_1900],
         dtype=np.float64,
     )
 
 
 def extract_cas_features(signal: np.ndarray, fs: int = FS_TARGET) -> np.ndarray:
-    """Compute 5 CAS-specific features.
+    """Compute 3 CAS-specific features.
 
     Args:
         signal: 1D numpy array.
         fs: Sample rate in Hz.
 
     Returns:
-        1D array of length 5: [n_spectral_peaks_100_1000, peak_sharpness,
-        autocorr_peak, harmonic_ratio, spectral_flatness (duplicate for CAS rule)].
+        1D array of length 3: [peak_sharpness, autocorr_peak, harmonic_ratio].
 
     Raises:
         ValueError: If signal is not 1D or is empty.
@@ -184,12 +166,11 @@ def extract_cas_features(signal: np.ndarray, fs: int = FS_TARGET) -> np.ndarray:
     nperseg = min(WELCH_NPERSEG, len(signal))
     freqs, psd = scipy.signal.welch(signal, fs=fs, nperseg=nperseg)
 
-    n_peaks = _count_spectral_peaks(freqs, psd)
     sharpness = _peak_sharpness(freqs, psd)
     ac_peak = _autocorr_peak(signal)
     harm_ratio = _harmonic_ratio(freqs, psd, fs)
 
-    return np.array([n_peaks, sharpness, ac_peak, harm_ratio], dtype=np.float64)
+    return np.array([sharpness, ac_peak, harm_ratio], dtype=np.float64)
 
 
 def extract_all_features(signal: np.ndarray, fs: int = FS_TARGET) -> np.ndarray:
@@ -200,7 +181,7 @@ def extract_all_features(signal: np.ndarray, fs: int = FS_TARGET) -> np.ndarray:
         fs: Sample rate in Hz.
 
     Returns:
-        1D array of length N_FEATURES (19).
+        1D array of length N_FEATURES (16).
     """
     temporal = extract_temporal_features(signal, fs)
     spectral = extract_spectral_features(signal, fs)
@@ -221,12 +202,87 @@ def build_feature_matrix(
         fs: Sample rate in Hz.
 
     Returns:
-        (N, N_FEATURES) float64 array.
+        (N, N_FEATURES) float64 array. Call normalize_amplitude_features_per_subject()
+        on the result before classifier training to remove per-subject amplitude bias.
     """
     rows = [extract_all_features(s, fs) for s in all_signals]
     X = np.vstack(rows)
     X = _impute_nonfinite(X)
     return X
+
+
+def normalize_amplitude_features_per_subject(
+    X: np.ndarray,
+    feature_names: list[str],
+    v_subject: np.ndarray,
+) -> np.ndarray:
+    """Z-score 'rms' and 'peak_to_peak' per subject to remove sensor-level amplitude bias.
+
+    Mean and std are computed from that subject's segments only.
+    Subjects with a single segment or zero std are left unchanged.
+
+    Args:
+        X: (N, n_features) feature matrix.
+        feature_names: List of feature names matching columns of X.
+        v_subject: (N,) int array of subject IDs.
+
+    Returns:
+        Copy of X with rms and peak_to_peak columns z-scored per subject.
+    """
+    X = X.copy()
+    amp_cols = [i for i, n in enumerate(feature_names) if n in ("rms", "peak_to_peak")]
+    for sid in np.unique(v_subject):
+        mask = v_subject == sid
+        for col in amp_cols:
+            vals = X[mask, col]
+            std = float(np.std(vals, ddof=1)) if int(np.sum(mask)) > 1 else 0.0
+            if std > 0.0:
+                X[mask, col] = (vals - float(np.mean(vals))) / std
+    return X
+
+
+def extract_labeling_features(signal: np.ndarray, fs: int = FS_TARGET) -> np.ndarray:
+    """Compute 4 features used exclusively by the CAS rule-based labeling function.
+
+    These features are NOT included in the ML feature matrix (FEATURE_NAMES) to
+    prevent a circular label/feature dependency.
+
+    Args:
+        signal: 1D numpy array.
+        fs: Sample rate in Hz.
+
+    Returns:
+        1D array of length 4 matching LABELING_FEATURE_NAMES:
+        [spectral_flatness, n_spectral_peaks_100_1000, duration_s, max_peak_prominence_frac].
+    """
+    _validate_signal(signal)
+    nperseg = min(WELCH_NPERSEG, len(signal))
+    freqs, psd = scipy.signal.welch(signal, fs=fs, nperseg=nperseg)
+    flatness = float(scipy.stats.gmean(psd + 1e-12) / np.mean(psd + 1e-12))
+    n_peaks = _count_spectral_peaks(freqs, psd)
+    duration_s = float(len(signal) / fs)
+    max_prom = _max_peak_prominence_fraction(freqs, psd)
+    return np.array([flatness, n_peaks, duration_s, max_prom], dtype=np.float64)
+
+
+def build_labeling_feature_matrix(
+    all_signals: list[np.ndarray],
+    fs: int = FS_TARGET,
+) -> np.ndarray:
+    """Build (N, 4) labeling feature matrix for use with make_rule_based_labels().
+
+    Separate from the ML feature matrix — these features are used only to
+    generate CAS labels and must not be passed to the classifier.
+
+    Args:
+        all_signals: List of 1D numpy arrays.
+        fs: Sample rate in Hz.
+
+    Returns:
+        (N, 4) float64 array with columns matching LABELING_FEATURE_NAMES.
+    """
+    rows = [extract_labeling_features(s, fs) for s in all_signals]
+    return np.vstack(rows)
 
 
 # ---------------------------------------------------------------------------
@@ -279,6 +335,27 @@ def _count_spectral_peaks(freqs: np.ndarray, psd: np.ndarray) -> float:
     peaks, _ = scipy.signal.find_peaks(psd, prominence=prominence_threshold)
     in_band = (freqs[peaks] >= CAS_FREQ_LOW) & (freqs[peaks] <= CAS_FREQ_HIGH)
     return float(np.sum(in_band))
+
+
+def _max_peak_prominence_fraction(freqs: np.ndarray, psd: np.ndarray) -> float:
+    """Max topographic prominence of peaks in CAS band, relative to max(psd).
+
+    Uses scipy prominence (height above surrounding valleys), not the
+    relative threshold used by _count_spectral_peaks.
+    Returns 0.0 if no peaks exist in the band or psd is flat.
+    """
+    if len(psd) < 3:
+        return 0.0
+    peaks, props = scipy.signal.find_peaks(psd, prominence=0)
+    if len(peaks) == 0:
+        return 0.0
+    in_band = (freqs[peaks] >= CAS_FREQ_LOW) & (freqs[peaks] <= CAS_FREQ_HIGH)
+    if not np.any(in_band):
+        return 0.0
+    max_psd = float(np.max(psd))
+    if max_psd == 0.0:
+        return 0.0
+    return float(np.max(props["prominences"][in_band]) / max_psd)
 
 
 def _peak_sharpness(freqs: np.ndarray, psd: np.ndarray) -> float:

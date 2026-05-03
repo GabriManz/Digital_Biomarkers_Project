@@ -7,6 +7,7 @@ Expected output: 14 900 segments with four integer metadata vectors.
 from __future__ import annotations
 
 import pickle
+import warnings
 from pathlib import Path
 
 import numpy as np
@@ -97,6 +98,15 @@ def build_dataset(
         "v_channel": np.array(v_channel, dtype=np.int32),
         "v_phase": np.array(v_phase, dtype=np.int32),
     }
+
+    actual = len(result["all_signals"])
+    if actual != EXPECTED_TOTAL_SEGMENTS:
+        warnings.warn(
+            f"Segment count mismatch: expected {EXPECTED_TOTAL_SEGMENTS}, "
+            f"got {actual}. Check for missing .mat files or marker errors.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
 
     if output_dir is not None:
         _save_dataset(result, Path(output_dir))

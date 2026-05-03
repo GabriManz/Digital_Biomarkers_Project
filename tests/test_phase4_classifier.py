@@ -10,7 +10,7 @@ from sklearn.model_selection import LeaveOneGroupOut
 
 from src.phase4_classifier import PIPELINES, make_rule_based_labels
 from src.phase4_validation import compute_metrics, run_loso, save_results_csv
-from src.phase3_features import FEATURE_NAMES
+from src.phase3_features import FEATURE_NAMES, LABELING_FEATURE_NAMES
 
 # ---------------------------------------------------------------------------
 # Synthetic data fixtures
@@ -120,22 +120,26 @@ class TestRuleBasedLabels:
         n_patients, n_controls = 100, 50
         n_total = n_patients + n_controls
 
-        X = rng.standard_normal((n_total, len(FEATURE_NAMES)))
+        # Use the labeling feature matrix (not the ML feature matrix)
+        X_label = np.zeros((n_total, len(LABELING_FEATURE_NAMES)))
 
-        i_flat = FEATURE_NAMES.index("spectral_flatness")
-        i_peaks = FEATURE_NAMES.index("n_spectral_peaks_100_1000")
-        i_dur = FEATURE_NAMES.index("duration_s")
+        i_flat = LABELING_FEATURE_NAMES.index("spectral_flatness")
+        i_peaks = LABELING_FEATURE_NAMES.index("n_spectral_peaks_100_1000")
+        i_dur = LABELING_FEATURE_NAMES.index("duration_s")
+        i_prom = LABELING_FEATURE_NAMES.index("max_peak_prominence_frac")
 
-        # Patients: low flatness, many peaks, long duration → high CAS rate
-        X[:n_patients, i_flat] = rng.uniform(0.01, 0.10, n_patients)
-        X[:n_patients, i_peaks] = rng.uniform(1, 5, n_patients)
-        X[:n_patients, i_dur] = rng.uniform(0.2, 1.0, n_patients)
+        # Patients: low flatness, many peaks, long duration, high prominence → high CAS rate
+        X_label[:n_patients, i_flat] = rng.uniform(0.01, 0.08, n_patients)
+        X_label[:n_patients, i_peaks] = rng.uniform(2, 5, n_patients)
+        X_label[:n_patients, i_dur] = rng.uniform(0.2, 1.0, n_patients)
+        X_label[:n_patients, i_prom] = rng.uniform(0.1, 0.5, n_patients)
 
         # Controls: high flatness → CAS = 0
-        X[n_patients:, i_flat] = rng.uniform(0.5, 1.0, n_controls)
-        X[n_patients:, i_dur] = rng.uniform(0.2, 1.0, n_controls)
+        X_label[n_patients:, i_flat] = rng.uniform(0.5, 1.0, n_controls)
+        X_label[n_patients:, i_dur] = rng.uniform(0.2, 1.0, n_controls)
+        X_label[n_patients:, i_prom] = rng.uniform(0.0, 0.04, n_controls)
 
-        labels = make_rule_based_labels(X, FEATURE_NAMES)
+        labels = make_rule_based_labels(X_label, LABELING_FEATURE_NAMES)
         patient_rate = float(np.mean(labels[:n_patients]))
         control_rate = float(np.mean(labels[n_patients:]))
         assert patient_rate > control_rate

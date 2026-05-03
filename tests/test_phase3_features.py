@@ -7,11 +7,13 @@ import pytest
 
 from src.phase3_features import (
     FEATURE_NAMES,
+    LABELING_FEATURE_NAMES,
     FS_TARGET,
     N_FEATURES,
     build_feature_matrix,
     extract_all_features,
     extract_cas_features,
+    extract_labeling_features,
     extract_spectral_features,
     extract_temporal_features,
 )
@@ -33,7 +35,7 @@ class TestTemporalFeatures:
     def test_temporal_features_return_correct_shape(self) -> None:
         sig = _sine(300.0)
         out = extract_temporal_features(sig)
-        assert out.shape == (6,)
+        assert out.shape == (5,)
 
     def test_rms_of_constant_signal(self) -> None:
         sig = np.ones(1000, dtype=np.float64)
@@ -64,7 +66,7 @@ class TestSpectralFeatures:
     def test_spectral_features_return_correct_shape(self) -> None:
         sig = _sine(500.0)
         out = extract_spectral_features(sig)
-        assert out.shape == (9,)
+        assert out.shape == (8,)
 
     def test_mean_freq_of_pure_sine(self, sine_500hz: np.ndarray) -> None:
         feats = extract_spectral_features(sine_500hz)
@@ -85,23 +87,31 @@ class TestSpectralFeatures:
     def test_spectral_flatness_white_noise_near_one(
         self, white_noise: np.ndarray
     ) -> None:
-        feats = extract_spectral_features(white_noise)
-        flatness = feats[8]
+        # spectral_flatness is now in LABELING_FEATURE_NAMES (index 0)
+        feats = extract_labeling_features(white_noise)
+        flatness = feats[0]
         assert flatness > 0.5  # white noise is spectrally flat
 
     def test_spectral_flatness_pure_sine_near_zero(
         self, sine_100hz: np.ndarray
     ) -> None:
-        feats = extract_spectral_features(sine_100hz)
-        flatness = feats[8]
+        # spectral_flatness is now in LABELING_FEATURE_NAMES (index 0)
+        feats = extract_labeling_features(sine_100hz)
+        flatness = feats[0]
         assert flatness < 0.2  # tonal signal → low flatness
 
 
 class TestCasFeatures:
     def test_n_spectral_peaks_for_single_sine(self, sine_100hz: np.ndarray) -> None:
-        feats = extract_cas_features(sine_100hz)
-        n_peaks = int(round(feats[0]))
+        # n_spectral_peaks_100_1000 is now in LABELING_FEATURE_NAMES (index 1)
+        feats = extract_labeling_features(sine_100hz)
+        n_peaks = int(round(feats[1]))
         assert n_peaks >= 1  # at least one peak at 100 Hz
+
+    def test_cas_features_return_correct_shape(self) -> None:
+        sig = _sine(300.0)
+        out = extract_cas_features(sig)
+        assert out.shape == (3,)
 
 
 class TestFeatureMatrix:
@@ -119,3 +129,9 @@ class TestFeatureMatrix:
 
     def test_feature_names_length_matches_n_features(self) -> None:
         assert len(FEATURE_NAMES) == N_FEATURES
+
+    def test_n_features_is_16(self) -> None:
+        assert N_FEATURES == 16
+
+    def test_labeling_feature_names_length(self) -> None:
+        assert len(LABELING_FEATURE_NAMES) == 4
