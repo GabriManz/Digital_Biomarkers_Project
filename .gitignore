@@ -1,7 +1,5 @@
 # Project data and generated artifacts
 Data/
-outputs/results/
-outputs/figures/
 
 # Python cache and bytecode
 __pycache__/
