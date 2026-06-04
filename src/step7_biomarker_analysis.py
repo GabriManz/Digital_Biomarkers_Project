@@ -14,6 +14,8 @@ import sys
 from pathlib import Path
 from typing import Union
 
+import matplotlib
+matplotlib.use("Agg")  # backend sin pantalla para entornos sin GUI
 import matplotlib.patches as mpatches
 import matplotlib.pyplot as plt
 import numpy as np
@@ -80,7 +82,7 @@ def load_data() -> tuple[
     v_phase   = ds["v_phase"]
 
     # Metadatos clínicos por sujeto
-    meta_path = PROJECT_ROOT / "database" / "subject_metadata.csv"
+    meta_path = PROJECT_ROOT / "Data" / "database" / "subject_metadata.csv"
     meta_df = pd.read_csv(meta_path)
 
     # Mapeo: número entero → ID de cadena (ej. 1 → "P1", 24 → "C1")
@@ -742,6 +744,11 @@ def verify_pipeline() -> None:
 
 def main() -> None:
     """Ejecuta el análisis de biomarcadores CAS (Partes 1–5)."""
+    # Forzar UTF-8 en stdout/stderr para evitar errores con caracteres especiales
+    # cuando el proceso corre en background (encoding por defecto: cp1252 en Windows)
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     FIGURES_DIR.mkdir(parents=True, exist_ok=True)
 
