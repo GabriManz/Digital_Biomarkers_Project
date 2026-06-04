@@ -1,0 +1,17 @@
+[
+  "rms",
+  "duration_s",
+  "zcr",
+  "kurtosis",
+  "skewness",
+  "tkeo_mean",
+  "freq_dominant",
+  "freq_mean",
+  "band_power_100_1000",
+  "band_power_70_200",
+  "band_power_200_600",
+  "band_power_600_1000",
+  "spectral_entropy",
+  "harmonic_ratio",
+  "sample_entropy"
+]
