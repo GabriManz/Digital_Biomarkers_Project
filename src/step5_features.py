@@ -213,7 +213,7 @@ def extract_features(signal: np.ndarray, fs: int = FS_TARGET) -> np.ndarray:
     # ------------------------------------------------------------------
     # 3. Zero-crossing rate
     # ------------------------------------------------------------------
-    feats[2] = np.sum(np.abs(np.diff(np.sign(signal)))) / (2 * n)
+    feats[2] = np.sum(np.abs(np.diff(np.sign(signal + 1e-10)))) / (2 * n)
 
     # ------------------------------------------------------------------
     # 4. Curtosis (Fisher, media cero para distribución normal)
@@ -242,9 +242,11 @@ def extract_features(signal: np.ndarray, fs: int = FS_TARGET) -> np.ndarray:
     total_power = np.sum(psd) + 1e-12   # evitar división por cero
 
     # ------------------------------------------------------------------
-    # 7. Frecuencia dominante
+    # 7. Frecuencia dominante (restringida a 70–2000 Hz para evitar
+    #    que el componente DC o derivas de baja frecuencia dominen)
     # ------------------------------------------------------------------
-    f_dom = float(f[np.argmax(psd)])
+    mask_valid = (f >= 70) & (f <= 2000)
+    f_dom = float(f[mask_valid][np.argmax(psd[mask_valid])]) if np.any(mask_valid) else 0.0
     feats[6] = f_dom
 
     # ------------------------------------------------------------------
@@ -290,14 +292,16 @@ def extract_features(signal: np.ndarray, fs: int = FS_TARGET) -> np.ndarray:
 
     # ------------------------------------------------------------------
     # 15. Sample entropy (submuestro a máx. 400 puntos para velocidad)
+    #     La tolerancia r se calcula sobre la señal submuestreada, no
+    #     sobre la original, para calibrarla respecto a los datos reales
+    #     que _sampen va a comparar.
     # ------------------------------------------------------------------
-    sig_std = np.std(signal)
-    if sig_std == 0.0 or n < 50:
+    if np.std(signal) == 0.0 or n < 50:
         feats[14] = 0.0
     else:
         step = max(1, n // 400)
         sig_sub = signal[::step]
-        r_tol = 0.2 * sig_std
+        r_tol = 0.2 * np.std(sig_sub)
         feats[14] = _sampen(sig_sub, m=2, r=r_tol)
 
     # ------------------------------------------------------------------

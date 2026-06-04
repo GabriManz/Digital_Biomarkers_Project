@@ -185,7 +185,12 @@ def compute_cas_metrics(
 
         cas_rate_pre  = (cas_pre  / n_pre  * 100.0) if n_pre  > 0 else 0.0
         cas_rate_post = (cas_post / n_post * 100.0) if n_post > 0 else 0.0
-        delta_cas     = (100.0 * (cas_pre - cas_post) / cas_pre) if cas_pre > 0 else 0.0
+        # Fórmula correcta: normaliza por n_pre y n_post para evitar sesgo
+        # cuando el número de segmentos pre y post no es idéntico
+        if cas_rate_pre > 0:
+            delta_cas = 100.0 * (cas_rate_pre - cas_rate_post) / cas_rate_pre
+        else:
+            delta_cas = 0.0
 
         meta = subject_meta[subject_id]
         bdr_group = "Controls" if meta["type"] == "control" else meta["bdr_label"]
@@ -730,12 +735,46 @@ def verify_pipeline() -> None:
     print("\n" + "=" * 48)
     print("PIPELINE COMPLETO — TODAS LAS VERIFICACIONES OK")
     print("=" * 48)
-    print(f"Step 5: features extraídas para 14900 señales")
+    print(f"Step 5: features extraidas para 14900 senales")
     print(f"Step 6: mejor modelo = {best_model}, AUC LOSO = {loso_auc:.3f}")
-    print(f"Step 7: análisis completado para {n_subjects} sujetos")
+    print(f"Step 7: analisis completado para {n_subjects} sujetos")
     print(f"Figuras generadas: outputs/figures/")
     print(f"Resultados guardados: outputs/results/")
     print("=" * 48)
+
+    # ── Tabla comparativa pre/post mejoras ──────────────────────────────
+    best_csv_path = s6_res / f"{best_model.lower()}_loso_results.csv"
+    sens_new = spec_new = float("nan")
+    if best_csv_path.exists():
+        df_best  = pd.read_csv(best_csv_path)
+        sens_new = float(df_best["sensitivity"].mean())
+        spec_new = float(df_best["specificity"].mean())
+
+    gs_path = s7_res / "group_statistics.csv"
+    mwu_new = float("nan")
+    if gs_path.exists():
+        gs_df   = pd.read_csv(gs_path)
+        fila    = gs_df[(gs_df["condition"] == "all") & (gs_df["group"] == "BDR+")]
+        if not fila.empty:
+            mwu_new = float(fila["mwu_pvalue"].values[0])
+
+    cas_rate_new = 100.0 * float(pred["y_pred_all"].mean())
+
+    print("\nCOMPARATIVA PRE/POST MEJORAS")
+    print("+---------------+--------------+--------------+")
+    print(f"| {'Metrica':<13} | {'Anterior':^12} | {'Nueva':^12} |")
+    print("+---------------+--------------+--------------+")
+    filas_tabla = [
+        ("Mejor modelo", "SVM",    best_model),
+        ("AUC LOSO",     "0.660",  f"{loso_auc:.3f}"),
+        ("Sensitivity",  "0.491",  f"{sens_new:.3f}" if not np.isnan(sens_new) else "N/A"),
+        ("Specificity",  "0.765",  f"{spec_new:.3f}" if not np.isnan(spec_new) else "N/A"),
+        ("p BDR+/BDR-",  "0.0067", f"{mwu_new:.4f}" if not np.isnan(mwu_new) else "N/A"),
+        ("CAS rate",     "27.0%",  f"{cas_rate_new:.1f}%"),
+    ]
+    for label, old_val, new_val in filas_tabla:
+        print(f"| {label:<13} | {old_val:^12} | {new_val:^12} |")
+    print("+---------------+--------------+--------------+")
 
 
 # ─────────────────────────────────────────────────────────────────────────────

@@ -27,7 +27,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import seaborn as sns
-from sklearn.ensemble import RandomForestClassifier
+from sklearn.ensemble import RandomForestClassifier, VotingClassifier
+from sklearn.feature_selection import SelectKBest, f_classif
 from sklearn.metrics import (
     accuracy_score,
     confusion_matrix,
@@ -85,7 +86,9 @@ _N_PATIENTS   = 23  # P1–P23
 _N_CONTROLS   = 5   # C1–C5
 
 # Colores por clasificador (usados en todas las figuras)
-_COLORS: dict[str, str] = {"SVM": "blue", "RF": "green", "XGB": "orange"}
+_COLORS: dict[str, str] = {
+    "SVM": "blue", "RF": "green", "XGB": "orange", "Ensemble": "purple",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -154,69 +157,114 @@ def load_data() -> tuple[
 
 def build_pipelines(y_labeled: np.ndarray) -> dict[str, Pipeline]:
     """
-    Construye los tres Pipelines sklearn (SVM, RF, XGBoost).
+    Construye los cuatro Pipelines sklearn: SVM, RF, XGBoost y Ensemble.
 
-    El scale_pos_weight de XGBoost se calcula a partir de y_labeled para
-    compensar el desbalance de clases de forma equivalente a class_weight.
+    Cada pipeline incluye tres pasos:
+        1. StandardScaler  — normalización de features
+        2. SelectKBest     — selección de las 10 features más informativas
+        3. Clasificador    — modelo de aprendizaje
+
+    Para el Ensemble (VotingClassifier soft), los sub-estimadores reciben
+    las features ya procesadas por el Pipeline externo, por lo que no
+    llevan scaler ni selector propio.
+
+    Los pesos de clase se fijan a {0:1, 1:3} para reforzar la sensibilidad
+    al detectar CAS, aceptando un pequeño coste en especificidad. Esto es
+    apropiado para un biomarcador de cribado donde los falsos negativos son
+    más costosos que los falsos positivos.
 
     Parámetros
     ----------
     y_labeled : np.ndarray
-        Etiquetas del subconjunto etiquetado (para calcular scale_pos_weight).
+        Etiquetas del subconjunto etiquetado (para calcular scale_pos_weight
+        de XGBoost de forma equivalente al class_weight de sklearn).
 
     Retorna
     -------
-    dict con claves "SVM", "RF" y, si xgboost está instalado, "XGB".
+    dict con claves "SVM", "RF", "XGB" (si instalado) y "Ensemble".
     """
     pipelines: dict[str, Pipeline] = {}
+    scale_pos_weight = float(np.sum(y_labeled == 0) / np.sum(y_labeled == 1))
 
-    # --- SVM con kernel RBF ---
+    # --- SVM con kernel RBF y peso 3x para clase CAS ---
     pipelines["SVM"] = Pipeline([
-        ("scaler", StandardScaler()),
-        ("clf", SVC(
+        ("scaler",   StandardScaler()),
+        ("selector", SelectKBest(f_classif, k=10)),
+        ("clf",      SVC(
             kernel="rbf",
             C=1.0,
             gamma="scale",
-            class_weight="balanced",
+            class_weight={0: 1, 1: 3},
             probability=True,
             random_state=RANDOM_STATE,
         )),
     ])
 
-    # --- Random Forest ---
+    # --- Random Forest con peso 3x para clase CAS ---
     pipelines["RF"] = Pipeline([
-        ("scaler", StandardScaler()),
-        ("clf", RandomForestClassifier(
+        ("scaler",   StandardScaler()),
+        ("selector", SelectKBest(f_classif, k=10)),
+        ("clf",      RandomForestClassifier(
             n_estimators=N_ESTIMATORS,
             max_depth=None,
-            class_weight="balanced",
+            class_weight={0: 1, 1: 3},
             random_state=RANDOM_STATE,
             n_jobs=-1,
         )),
     ])
 
-    # --- XGBoost (opcional) ---
+    # --- XGBoost con subsampling y compensación de desbalance ---
     if XGBClassifier is not None:
-        scale_pos_weight = float(np.sum(y_labeled == 0) / np.sum(y_labeled == 1))
         xgb_params: dict[str, Any] = dict(
             n_estimators=N_ESTIMATORS,
             max_depth=6,
             learning_rate=0.1,
             scale_pos_weight=scale_pos_weight,
+            subsample=0.8,
+            colsample_bytree=0.8,
             random_state=RANDOM_STATE,
             eval_metric="logloss",
             verbosity=0,
         )
         try:
-            # use_label_encoder fue eliminado en XGBoost 2.0; lo ignoramos si falla
+            # use_label_encoder eliminado en XGBoost 2.0; se ignora si falla
             xgb_clf = XGBClassifier(**xgb_params, use_label_encoder=False)
         except TypeError:
             xgb_clf = XGBClassifier(**xgb_params)
 
         pipelines["XGB"] = Pipeline([
-            ("scaler", StandardScaler()),
-            ("clf", xgb_clf),
+            ("scaler",   StandardScaler()),
+            ("selector", SelectKBest(f_classif, k=10)),
+            ("clf",      xgb_clf),
         ])
+
+    # --- Ensemble: VotingClassifier soft con los tres modelos base ---
+    # Los sub-estimadores son clasificadores puros (sin scaler/selector propio)
+    # porque el Pipeline externo ya aplica escalado y selección de features.
+    svm_ens = SVC(
+        kernel="rbf", C=1.0, gamma="scale",
+        class_weight={0: 1, 1: 3},
+        probability=True, random_state=RANDOM_STATE,
+    )
+    rf_ens = RandomForestClassifier(
+        n_estimators=N_ESTIMATORS,
+        class_weight={0: 1, 1: 3},
+        random_state=RANDOM_STATE, n_jobs=-1,
+    )
+    estimators_ens: list[tuple[str, Any]] = [("svm", svm_ens), ("rf", rf_ens)]
+
+    if XGBClassifier is not None:
+        try:
+            xgb_ens = XGBClassifier(**xgb_params, use_label_encoder=False)
+        except TypeError:
+            xgb_ens = XGBClassifier(**xgb_params)
+        estimators_ens.append(("xgb", xgb_ens))
+
+    pipelines["Ensemble"] = Pipeline([
+        ("scaler",   StandardScaler()),
+        ("selector", SelectKBest(f_classif, k=10)),
+        ("clf",      VotingClassifier(estimators=estimators_ens, voting="soft")),
+    ])
 
     return pipelines
 
@@ -571,32 +619,35 @@ def plot_feature_importance(
 
         pipe = copy.deepcopy(pipelines[name])
         pipe.fit(X_labeled, y_labeled)
-        clf  = pipe.named_steps["clf"]
+        clf      = pipe.named_steps["clf"]
+        selector = pipe.named_steps["selector"]
+
+        # Recuperar los nombres de las 10 features seleccionadas en este fold
+        selected_idx   = selector.get_support(indices=True)
+        selected_names = [feature_names[i] for i in selected_idx]
 
         if name == "RF":
             importances = np.array(clf.feature_importances_, dtype=float)
-            models_to_plot.append((name, "green", importances))
+            models_to_plot.append((name, "green", importances, selected_names))
 
         elif name == "XGB":
             try:
-                # total_gain: dict con claves 'f0', 'f1', ... (sin nombres explícitos)
+                # total_gain: dict con claves 'f0', 'f1', ... referidas a las
+                # 10 features seleccionadas (no a las 15 originales)
                 score_dict  = clf.get_booster().get_score(importance_type="total_gain")
-                importances = np.zeros(len(feature_names), dtype=float)
+                importances = np.zeros(len(selected_names), dtype=float)
                 for key, val in score_dict.items():
                     if key.startswith("f") and key[1:].isdigit():
                         idx = int(key[1:])
-                        if idx < len(feature_names):
+                        if idx < len(selected_names):
                             importances[idx] = float(val)
-                    elif key in feature_names:
-                        importances[feature_names.index(key)] = float(val)
             except Exception:
-                # Fallback a feature_importances_ estándar (weight)
                 importances = np.array(
                     getattr(clf, "feature_importances_",
-                            np.zeros(len(feature_names))),
+                            np.zeros(len(selected_names))),
                     dtype=float,
                 )
-            models_to_plot.append((name, "orange", importances))
+            models_to_plot.append((name, "orange", importances, selected_names))
 
     if not models_to_plot:
         return
@@ -606,10 +657,10 @@ def plot_feature_importance(
     if n_plots == 1:
         axes = [axes]
 
-    for ax, (name, color, importances) in zip(axes, models_to_plot):
+    for ax, (name, color, importances, feat_names_sel) in zip(axes, models_to_plot):
         # Ordenar ascendente para que la barra más importante quede arriba en barh
         order     = np.argsort(importances)
-        names_ord = [feature_names[i] for i in order]
+        names_ord = [feat_names_sel[i] for i in order]
         vals_ord  = importances[order]
 
         ax.barh(names_ord, vals_ord, color=color, alpha=0.8)
@@ -705,6 +756,9 @@ def plot_cas_rate_by_group(
 
 def main() -> None:
     """Orquesta el pipeline completo de clasificación (partes 1–5)."""
+    import sys as _sys
+    _sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    _sys.stderr.reconfigure(encoding="utf-8", errors="replace")
     t_total = time.time()
 
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -744,6 +798,30 @@ def main() -> None:
             f"{name}  — AUC: {res['mean']['auc']:.3f} ± {res['std']['auc']:.3f}"
             f" | F1: {res['mean']['f1']:.3f} ± {res['std']['f1']:.3f}"
         )
+
+    # ------------------------------------------------------------------ Tabla comparativa LOSO
+    ancho_m = 10
+    ancho_v = 13
+    sep = "+" + "-" * (ancho_m + 2) + ("+" + "-" * (ancho_v + 2)) * 4 + "+"
+    print("\n" + sep)
+    print(
+        f"| {'Modelo':<{ancho_m}} "
+        f"| {'Accuracy':^{ancho_v}} "
+        f"| {'Sensitivity':^{ancho_v}} "
+        f"| {'Specificity':^{ancho_v}} "
+        f"| {'AUC':^{ancho_v}} |"
+    )
+    print(sep)
+    for name, res in results.items():
+        m, s = res["mean"], res["std"]
+        print(
+            f"| {name:<{ancho_m}} "
+            f"| {m['accuracy']:.2f} +/- {s['accuracy']:.2f}  "
+            f"| {m['sensitivity']:.2f} +/- {s['sensitivity']:.2f}  "
+            f"| {m['specificity']:.2f} +/- {s['specificity']:.2f}  "
+            f"| {m['auc']:.2f} +/- {s['auc']:.2f}  |"
+        )
+    print(sep)
 
     # ------------------------------------------------------------------ P4
     print("\n" + "=" * 60)
