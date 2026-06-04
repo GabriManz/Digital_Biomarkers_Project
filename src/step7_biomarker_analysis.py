@@ -185,10 +185,9 @@ def compute_cas_metrics(
 
         cas_rate_pre  = (cas_pre  / n_pre  * 100.0) if n_pre  > 0 else 0.0
         cas_rate_post = (cas_post / n_post * 100.0) if n_post > 0 else 0.0
-        # Fórmula correcta: normaliza por n_pre y n_post para evitar sesgo
-        # cuando el número de segmentos pre y post no es idéntico
-        if cas_rate_pre > 0:
-            delta_cas = 100.0 * (cas_rate_pre - cas_rate_post) / cas_rate_pre
+        # Fórmula del enunciado: 100 * (pre - post) / pre  (conteos brutos)
+        if cas_pre > 0:
+            delta_cas = 100.0 * (cas_pre - cas_post) / cas_pre
         else:
             delta_cas = 0.0
 

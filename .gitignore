@@ -22,8 +22,20 @@ pip-wheel-metadata/
 # Virtual environments
 .venv/
 venv/
+venv_dl/
 env/
 ENV/
+
+# Logs de ejecución
+outputs/pipeline_run.log
+outputs/pipeline_run_err.log
+
+# Backups de features
+outputs/results/step5/*_old.npy
+
+# Archivos grandes de step8 (>50MB, generables con caché)
+outputs/results/step8/labeled_signals.pkl
+outputs/results/step8/X_spectrograms_all14900.npy
 
 # Jupyter
 .ipynb_checkpoints/

@@ -194,20 +194,20 @@ def build_pipelines(y_labeled: np.ndarray) -> dict[str, Pipeline]:
             kernel="rbf",
             C=1.0,
             gamma="scale",
-            class_weight={0: 1, 1: 3},
+            class_weight='balanced',
             probability=True,
             random_state=RANDOM_STATE,
         )),
     ])
 
-    # --- Random Forest con peso 3x para clase CAS ---
+    # --- Random Forest con clase balanceada ---
     pipelines["RF"] = Pipeline([
         ("scaler",   StandardScaler()),
         ("selector", SelectKBest(f_classif, k=10)),
         ("clf",      RandomForestClassifier(
             n_estimators=N_ESTIMATORS,
             max_depth=None,
-            class_weight={0: 1, 1: 3},
+            class_weight='balanced',
             random_state=RANDOM_STATE,
             n_jobs=-1,
         )),
@@ -243,12 +243,12 @@ def build_pipelines(y_labeled: np.ndarray) -> dict[str, Pipeline]:
     # porque el Pipeline externo ya aplica escalado y selección de features.
     svm_ens = SVC(
         kernel="rbf", C=1.0, gamma="scale",
-        class_weight={0: 1, 1: 3},
+        class_weight='balanced',
         probability=True, random_state=RANDOM_STATE,
     )
     rf_ens = RandomForestClassifier(
         n_estimators=N_ESTIMATORS,
-        class_weight={0: 1, 1: 3},
+        class_weight='balanced',
         random_state=RANDOM_STATE, n_jobs=-1,
     )
     estimators_ens: list[tuple[str, Any]] = [("svm", svm_ens), ("rf", rf_ens)]
@@ -414,9 +414,8 @@ def select_and_retrain(
     y_pred_all    : (14900,) predicciones binarias int
     y_prob_all    : (14900,) probabilidades de CAS float
     """
-    best_name = max(results, key=lambda k: results[k]["mean"]["auc"])
-    best_auc  = results[best_name]["mean"]["auc"]
-    print(f"\nMejor modelo: {best_name} (AUC LOSO = {best_auc:.3f})")
+    best_name = max(results, key=lambda m: results[m]["mean"]["auc"])
+    print(f"\nMejor modelo seleccionado por AUC LOSO: {best_name}")
 
     best_pipeline = copy.deepcopy(pipelines[best_name])
     best_pipeline.fit(X_labeled, y_labeled)
@@ -785,10 +784,33 @@ def main() -> None:
     print("=" * 60)
     results: dict[str, dict[str, Any]] = {}
 
+    # Identificar sujetos con suficientes señales CAS para entrenar
+    MIN_CAS_TRAIN = 5
+
+    cas_per_subject = {}
+    for sid in np.unique(groups):
+        mask_sid = groups == sid
+        cas_per_subject[sid] = np.sum(y_labeled[mask_sid] == 1)
+
+    valid_subjects = [sid for sid, n in cas_per_subject.items()
+                      if n >= MIN_CAS_TRAIN]
+
+    excluded = {sid: n for sid, n in cas_per_subject.items() if n < MIN_CAS_TRAIN}
+    print(f"Sujetos excluidos del LOSO (< {MIN_CAS_TRAIN} señales CAS):")
+    for sid, n in excluded.items():
+        subj_id = _num_to_subj_id(int(sid))
+        print(f"  {subj_id}: {n} señales CAS → excluido")
+    print(f"Folds LOSO: {len(valid_subjects)}")
+
+    mask_valid = np.isin(groups, valid_subjects)
+    X_loso   = X_labeled[mask_valid]
+    y_loso   = y_labeled[mask_valid]
+    grp_loso = groups[mask_valid]
+
     for name, pipeline in pipelines.items():
         print(f"\n--- {name} ---")
         t0  = time.time()
-        res = run_loso(pipeline, X_labeled, y_labeled, groups, clf_name=name)
+        res = run_loso(pipeline, X_loso, y_loso, grp_loso, clf_name=name)
         elapsed = (time.time() - t0) / 60
         results[name] = res
 
