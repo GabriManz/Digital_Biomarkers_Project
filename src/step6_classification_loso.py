@@ -2,13 +2,18 @@
 Entrenamiento de clasificadores, evaluación Leave-One-Subject-Out (LOSO)
 e inferencia sobre las 14 900 señales respiratorias.
 
-Lee las matrices de features generadas por step5_features.py, entrena tres
-clasificadores (SVM, Random Forest, XGBoost), selecciona el mejor por AUC
-en LOSO, lo re-entrena sobre todos los datos etiquetados y predice en las
-14 900 señales para su uso en step7_biomarker_analysis.py.
+Versión LOSO rigurosa: cada fold deja fuera un paciente completo.
+Compatible con las 164 features generadas por step5_features.py.
+
+Diferencias respecto a step6_classification.py (versión StratifiedKFold):
+  - Validación : LeaveOneGroupOut  (un paciente fuera por fold)
+  - SelectKBest: k=30 dentro de cada fold  (filtra features de identidad)
+  - Modelos    : SVM, RF, XGB, Ensemble  (sin LR ni SVM-Lin)
+  - Sin SMOTE  : class_weight='balanced' compensa el desbalance
+  - Salidas    : outputs/results/step6_loso/  y  outputs/figures/step6_loso/
 
 Uso:
-    python src/step6_classification.py
+    python src/step6_classification_loso.py
 """
 
 from __future__ import annotations
@@ -27,9 +32,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import seaborn as sns
-from imblearn.over_sampling import SMOTE
 from sklearn.ensemble import RandomForestClassifier, VotingClassifier
-from sklearn.linear_model import LogisticRegression
+from sklearn.feature_selection import SelectKBest, f_classif
 from sklearn.metrics import (
     accuracy_score,
     confusion_matrix,
@@ -39,7 +43,7 @@ from sklearn.metrics import (
     roc_auc_score,
     roc_curve,
 )
-from sklearn.model_selection import StratifiedKFold
+from sklearn.model_selection import LeaveOneGroupOut
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 from sklearn.svm import SVC
@@ -76,8 +80,8 @@ _PROJECT_ROOT = _find_project_root()
 
 RANDOM_STATE  = 42
 N_ESTIMATORS  = 300
-RESULTS_DIR   = _PROJECT_ROOT / "outputs" / "results" / "step6"
-FIGURES_DIR   = _PROJECT_ROOT / "outputs" / "figures" / "step6"
+RESULTS_DIR   = _PROJECT_ROOT / "outputs" / "results" / "step6_loso"
+FIGURES_DIR   = _PROJECT_ROOT / "outputs" / "figures" / "step6_loso"
 
 _STEP5_DIR    = _PROJECT_ROOT / "outputs" / "results" / "step5"
 _STEP4_NPZ    = _PROJECT_ROOT / "outputs" / "results" / "step4" / "dataset.npz"
@@ -86,11 +90,8 @@ _METADATA_CSV = _PROJECT_ROOT / "Data" / "database" / "subject_metadata.csv"
 _N_PATIENTS   = 23  # P1–P23
 _N_CONTROLS   = 5   # C1–C5
 
-N_SPLITS = 5   # folds para StratifiedKFold
-
 # Colores por clasificador (usados en todas las figuras)
 _COLORS: dict[str, str] = {
-    "LR": "#4e79a7", "SVM-Lin": "#f28e2b",
     "SVM": "blue", "RF": "green", "XGB": "orange", "Ensemble": "purple",
 }
 
@@ -161,56 +162,48 @@ def load_data() -> tuple[
 
 def build_pipelines(y_labeled: np.ndarray) -> dict[str, Pipeline]:
     """
-    Construye los seis Pipelines sklearn: LR, SVM-Lin, SVM-RBF, RF, XGBoost y Ensemble.
+    Construye los cuatro Pipelines sklearn: SVM, RF, XGBoost y Ensemble.
 
-    Cada pipeline incluye dos pasos:
+    Cada pipeline incluye tres pasos:
         1. StandardScaler  — normalización de features
-        2. Clasificador    — modelo de aprendizaje
+        2. SelectKBest     — selección de las 10 features más informativas
+        3. Clasificador    — modelo de aprendizaje
 
-    La selección de features (SelectKBest) se omite porque SMOTE y los 164
-    features ya proporcionan suficiente señal. El desbalance de clases se
-    gestiona con class_weight='balanced' y SMOTE en el bucle de validación.
+    Para el Ensemble (VotingClassifier soft), los sub-estimadores reciben
+    las features ya procesadas por el Pipeline externo, por lo que no
+    llevan scaler ni selector propio.
+
+    Los pesos de clase se fijan a {0:1, 1:3} para reforzar la sensibilidad
+    al detectar CAS, aceptando un pequeño coste en especificidad. Esto es
+    apropiado para un biomarcador de cribado donde los falsos negativos son
+    más costosos que los falsos positivos.
 
     Parámetros
     ----------
     y_labeled : np.ndarray
         Etiquetas del subconjunto etiquetado (para calcular scale_pos_weight
-        de XGBoost).
+        de XGBoost de forma equivalente al class_weight de sklearn).
 
     Retorna
     -------
-    dict con claves "LR", "SVM-Lin", "SVM", "RF", "XGB" y "Ensemble".
+    dict con claves "SVM", "RF", "XGB" (si instalado) y "Ensemble".
     """
     pipelines: dict[str, Pipeline] = {}
     scale_pos_weight = float(np.sum(y_labeled == 0) / np.sum(y_labeled == 1))
 
-    # --- Logistic Regression ---
-    pipelines["LR"] = Pipeline([
-        ("scaler", StandardScaler()),
-        ("clf",    LogisticRegression(
-            C=1.0, max_iter=1000,
-            class_weight="balanced",
-            random_state=RANDOM_STATE,
-        )),
-    ])
+    # k=30: selecciona las 30 features más discriminativas en cada fold LOSO,
+    # filtrando features de identidad del paciente (MFCCs absolutos, etc.)
+    K_BEST = 30
 
-    # --- SVM lineal ---
-    pipelines["SVM-Lin"] = Pipeline([
-        ("scaler", StandardScaler()),
-        ("clf",    SVC(
-            kernel="linear", C=1.0,
-            class_weight="balanced",
-            probability=True,
-            random_state=RANDOM_STATE,
-        )),
-    ])
-
-    # --- SVM RBF ---
+    # --- SVM con kernel RBF ---
     pipelines["SVM"] = Pipeline([
-        ("scaler", StandardScaler()),
-        ("clf",    SVC(
-            kernel="rbf", C=10.0, gamma="scale",
-            class_weight="balanced",
+        ("scaler",   StandardScaler()),
+        ("selector", SelectKBest(f_classif, k=K_BEST)),
+        ("clf",      SVC(
+            kernel="rbf",
+            C=1.0,
+            gamma="scale",
+            class_weight='balanced',
             probability=True,
             random_state=RANDOM_STATE,
         )),
@@ -218,10 +211,12 @@ def build_pipelines(y_labeled: np.ndarray) -> dict[str, Pipeline]:
 
     # --- Random Forest ---
     pipelines["RF"] = Pipeline([
-        ("scaler", StandardScaler()),
-        ("clf",    RandomForestClassifier(
-            n_estimators=500, max_depth=10,
-            class_weight="balanced",
+        ("scaler",   StandardScaler()),
+        ("selector", SelectKBest(f_classif, k=K_BEST)),
+        ("clf",      RandomForestClassifier(
+            n_estimators=N_ESTIMATORS,
+            max_depth=10,
+            class_weight='balanced',
             random_state=RANDOM_STATE,
             n_jobs=-1,
         )),
@@ -230,12 +225,15 @@ def build_pipelines(y_labeled: np.ndarray) -> dict[str, Pipeline]:
     # --- XGBoost ---
     if XGBClassifier is not None:
         xgb_params: dict[str, Any] = dict(
-            n_estimators=300, max_depth=5,
+            n_estimators=N_ESTIMATORS,
+            max_depth=5,
             learning_rate=0.05,
             scale_pos_weight=scale_pos_weight,
-            subsample=0.8, colsample_bytree=0.8,
+            subsample=0.8,
+            colsample_bytree=0.8,
             random_state=RANDOM_STATE,
-            eval_metric="logloss", verbosity=0,
+            eval_metric="logloss",
+            verbosity=0,
         )
         try:
             xgb_clf = XGBClassifier(**xgb_params, use_label_encoder=False)
@@ -243,15 +241,22 @@ def build_pipelines(y_labeled: np.ndarray) -> dict[str, Pipeline]:
             xgb_clf = XGBClassifier(**xgb_params)
 
         pipelines["XGB"] = Pipeline([
-            ("scaler", StandardScaler()),
-            ("clf",    xgb_clf),
+            ("scaler",   StandardScaler()),
+            ("selector", SelectKBest(f_classif, k=K_BEST)),
+            ("clf",      xgb_clf),
         ])
 
-    # --- Ensemble: VotingClassifier soft (SVM-RBF + RF + XGB) ---
-    svm_ens = SVC(kernel="rbf", C=10.0, gamma="scale",
-                  class_weight="balanced", probability=True, random_state=RANDOM_STATE)
-    rf_ens  = RandomForestClassifier(n_estimators=500, max_depth=10,
-                                     class_weight="balanced", random_state=RANDOM_STATE, n_jobs=-1)
+    # --- Ensemble: VotingClassifier soft ---
+    svm_ens = SVC(
+        kernel="rbf", C=1.0, gamma="scale",
+        class_weight='balanced',
+        probability=True, random_state=RANDOM_STATE,
+    )
+    rf_ens = RandomForestClassifier(
+        n_estimators=N_ESTIMATORS, max_depth=10,
+        class_weight='balanced',
+        random_state=RANDOM_STATE, n_jobs=-1,
+    )
     estimators_ens: list[tuple[str, Any]] = [("svm", svm_ens), ("rf", rf_ens)]
 
     if XGBClassifier is not None:
@@ -262,8 +267,9 @@ def build_pipelines(y_labeled: np.ndarray) -> dict[str, Pipeline]:
         estimators_ens.append(("xgb", xgb_ens))
 
     pipelines["Ensemble"] = Pipeline([
-        ("scaler", StandardScaler()),
-        ("clf",    VotingClassifier(estimators=estimators_ens, voting="soft")),
+        ("scaler",   StandardScaler()),
+        ("selector", SelectKBest(f_classif, k=K_BEST)),
+        ("clf",      VotingClassifier(estimators=estimators_ens, voting="soft")),
     ])
 
     return pipelines
@@ -281,70 +287,62 @@ def run_loso(
     clf_name: str = "",
 ) -> dict[str, Any]:
     """
-    Ejecuta StratifiedKFold(5) con SMOTE sobre el pipeline indicado.
+    Ejecuta Leave-One-Subject-Out cross-validation sobre el pipeline indicado.
 
-    En cada fold:
-      - Se hace deepcopy del pipeline para garantizar independencia.
-      - Se aplica SMOTE al conjunto de entrenamiento para balancear clases.
-      - Se calculan accuracy, sensibilidad, especificidad, precisión, F1 y AUC.
+    En cada fold se hace deepcopy del pipeline para garantizar independencia
+    entre iteraciones. Se calculan accuracy, sensibilidad, especificidad,
+    precisión, F1 y AUC para el sujeto dejado fuera.
 
     Parámetros
     ----------
     pipeline : Pipeline
         Pipeline sklearn con scaler + clf (sin entrenar).
     X : np.ndarray
-        Matriz de features (N, 164).
+        Matriz de features (1923, 15).
     y : np.ndarray
-        Etiquetas binarias (N,).
+        Etiquetas binarias (1923,).
     groups : np.ndarray
-        No utilizado en StratifiedKFold (mantenido para compatibilidad).
+        IDs numéricos de sujeto (1923,) para la partición LOSO.
     clf_name : str
         Nombre del clasificador para los mensajes de progreso.
 
     Retorna
     -------
     dict con claves:
-        per_fold   — lista de dicts, uno por fold
+        per_fold   — lista de dicts, uno por fold (sujeto)
         mean       — dict con la media de cada métrica entre folds
         std        — dict con la desviación estándar de cada métrica
-        y_true_all — (N,) etiquetas reales concatenadas
-        y_pred_all — (N,) predicciones binarias concatenadas
-        y_prob_all — (N,) probabilidades de clase 1 concatenadas
+        y_true_all — (n,) verdaderos etiquetas concatenados por fold
+        y_pred_all — (n,) predicciones binarias concatenadas
+        y_prob_all — (n,) probabilidades de clase 1 concatenadas
     """
-    skf     = StratifiedKFold(n_splits=N_SPLITS, shuffle=True, random_state=RANDOM_STATE)
-    n_folds = skf.get_n_splits(X, y)
+    loso    = LeaveOneGroupOut()
+    n_folds = loso.get_n_splits(X, y, groups)
 
     per_fold: list[dict[str, Any]] = []
     y_true_list: list[np.ndarray] = []
     y_pred_list: list[np.ndarray] = []
     y_prob_list: list[np.ndarray] = []
 
-    for fold_i, (train_idx, test_idx) in enumerate(skf.split(X, y), start=1):
+    for fold_i, (train_idx, test_idx) in enumerate(loso.split(X, y, groups), start=1):
         X_train, X_test = X[train_idx], X[test_idx]
         y_train, y_test = y[train_idx], y[test_idx]
 
-        # Orden correcto: Scaler → SMOTE → fit clasificador
-        scaler = StandardScaler()
-        X_tr_sc = scaler.fit_transform(X_train)
-        X_te_sc = scaler.transform(X_test)
+        subj_num = int(groups[test_idx[0]])
+        subj_id  = _num_to_subj_id(subj_num)
 
-        y_tr = y_train.copy()
-        if y_tr.sum() > 1 and (y_tr == 0).sum() > 1:
-            sm      = SMOTE(random_state=RANDOM_STATE,
-                            k_neighbors=min(5, int(y_tr.sum()) - 1))
-            X_tr_sc, y_tr = sm.fit_resample(X_tr_sc, y_tr)
+        pipe = copy.deepcopy(pipeline)
+        pipe.fit(X_train, y_train)
 
-        clf = copy.deepcopy(pipeline.named_steps["clf"])
-        clf.fit(X_tr_sc, y_tr)
-
-        y_pred = clf.predict(X_te_sc)
-        y_prob = clf.predict_proba(X_te_sc)[:, 1]
+        y_pred = pipe.predict(X_test)
+        y_prob = pipe.predict_proba(X_test)[:, 1]
 
         acc  = float(accuracy_score(y_test, y_pred))
         sens = float(recall_score(y_test, y_pred, zero_division=0))
         prec = float(precision_score(y_test, y_pred, zero_division=0))
         f1   = float(f1_score(y_test, y_pred, zero_division=0))
 
+        # Especificidad: tn / (tn + fp) — calculada manualmente
         cm             = confusion_matrix(y_test, y_pred, labels=[0, 1])
         tn, fp, fn, tp = cm.ravel()
         spec           = float(tn / (tn + fp)) if (tn + fp) > 0 else 0.0
@@ -352,11 +350,12 @@ def run_loso(
         try:
             auc = float(roc_auc_score(y_test, y_prob))
         except ValueError:
+            # El fold tiene una sola clase presente; AUC no definida
             auc = 0.0
 
         fold_dict: dict[str, Any] = {
             "fold":        fold_i,
-            "subject_id":  f"fold_{fold_i}",
+            "subject_id":  subj_id,
             "accuracy":    acc,
             "sensitivity": sens,
             "specificity": spec,
@@ -369,11 +368,12 @@ def run_loso(
         y_pred_list.append(y_pred)
         y_prob_list.append(y_prob)
 
-        print(f"  Fold {fold_i}/{n_folds} — Acc: {acc:.3f}  AUC: {auc:.3f}")
+        print(f"  Fold {fold_i:2d}/{n_folds} — Sujeto {subj_id:4s} — AUC: {auc:.3f}")
 
-    metric_keys = ["accuracy", "sensitivity", "specificity", "precision", "f1", "auc"]
-    mean_dict   = {m: float(np.mean([f[m] for f in per_fold])) for m in metric_keys}
-    std_dict    = {m: float(np.std( [f[m] for f in per_fold])) for m in metric_keys}
+    # Estadísticas agregadas entre folds
+    metrics   = ["accuracy", "sensitivity", "specificity", "precision", "f1", "auc"]
+    mean_dict = {m: float(np.mean([f[m] for f in per_fold])) for m in metrics}
+    std_dict  = {m: float(np.std([f[m] for f in per_fold]))  for m in metrics}
 
     return {
         "per_fold":   per_fold,
@@ -391,7 +391,7 @@ def _save_loso_csv(per_fold: list[dict[str, Any]], clf_name: str) -> None:
              "specificity", "precision", "f1", "auc"]
     fname = RESULTS_DIR / f"{clf_name.lower()}_loso_results.csv"
     pd.DataFrame(per_fold)[cols].to_csv(fname, index=False, float_format="%.4f")
-    print(f"  Resultados guardados: {fname.name}")
+    print(f"  Resultados LOSO guardados: {fname.name}")
 
 
 # ===========================================================================
@@ -421,22 +421,13 @@ def select_and_retrain(
     y_prob_all    : (14900,) probabilidades de CAS float
     """
     best_name = max(results, key=lambda m: results[m]["mean"]["auc"])
-    print(f"\nMejor modelo seleccionado por AUC: {best_name}")
+    print(f"\nMejor modelo seleccionado por AUC LOSO: {best_name}")
 
-    # Reentrenar con el mismo orden Scaler → SMOTE → clf
-    scaler_final = StandardScaler()
-    X_sc = scaler_final.fit_transform(X_labeled)
-    y_aug = y_labeled.copy()
-    if y_aug.sum() > 1 and (y_aug == 0).sum() > 1:
-        sm    = SMOTE(random_state=RANDOM_STATE)
-        X_sc, y_aug = sm.fit_resample(X_sc, y_aug)
+    best_pipeline = copy.deepcopy(pipelines[best_name])
+    best_pipeline.fit(X_labeled, y_labeled)
 
-    best_clf = copy.deepcopy(pipelines[best_name].named_steps["clf"])
-    best_clf.fit(X_sc, y_aug)
-
-    X_all_sc   = scaler_final.transform(X_all)
-    y_pred_all = best_clf.predict(X_all_sc).astype(int)
-    y_prob_all = best_clf.predict_proba(X_all_sc)[:, 1]
+    y_pred_all = best_pipeline.predict(X_all).astype(int)
+    y_prob_all = best_pipeline.predict_proba(X_all)[:, 1]
 
     # Guardar predicciones en disco
     np.savez(
@@ -445,13 +436,13 @@ def select_and_retrain(
         y_prob_all=y_prob_all,
         best_model_name=np.array(best_name),
     )
-    joblib.dump({"clf": best_clf, "scaler": scaler_final}, RESULTS_DIR / "best_model.pkl")
+    joblib.dump(best_pipeline, RESULTS_DIR / "best_model.pkl")
 
     n_cas = int(y_pred_all.sum())
     n_all = len(y_pred_all)
     print(f"Señales clasificadas como CAS : {n_cas} / {n_all} ({100 * n_cas / n_all:.1f}%)")
 
-    return best_name, best_clf, y_pred_all, y_prob_all
+    return best_name, best_pipeline, y_pred_all, y_prob_all
 
 
 # ===========================================================================
@@ -539,36 +530,72 @@ def plot_loso_auc_per_fold(
     figures_dir: Path,
 ) -> None:
     """
-    Figura 3: AUC por fold (StratifiedKFold-5) para cada clasificador.
-    Las líneas discontinuas muestran el AUC medio de cada modelo.
+    Figura 3: Evolución del AUC por sujeto (fold) para cada clasificador.
+
+    Los marcadores en el eje X indican el estado BDR de cada sujeto:
+      - BDR+ → círculo verde
+      - BDR- → cuadrado azul
+    Las líneas de trazo discontinuo muestran el AUC medio de cada clasificador.
     """
-    first_name = next(iter(results))
-    n_folds    = len(results[first_name]["per_fold"])
-    x_pos      = np.arange(1, n_folds + 1)
+    bdr_map = dict(zip(metadata_df["subject_id"], metadata_df["bdr_label"]))
 
-    fig, ax = plt.subplots(figsize=(10, 5))
+    # Usar el primer clasificador disponible para definir el orden de sujetos
+    first_name       = next(iter(results))
+    subj_ids_ordered = [f["subject_id"] for f in results[first_name]["per_fold"]]
+    x_pos            = np.arange(len(subj_ids_ordered))
 
-    clf_handles = []
+    fig, ax = plt.subplots(figsize=(14, 6))
+
+    # Líneas por clasificador
     for name, res in results.items():
         aucs  = [f["auc"] for f in res["per_fold"]]
         color = _COLORS.get(name, "black")
-        ax.plot(x_pos, aucs, color=color, lw=2, alpha=0.8, marker="o", ms=5)
-        ax.axhline(res["mean"]["auc"], color=color, ls="--", lw=1.2, alpha=0.6)
-        clf_handles.append(
-            mlines.Line2D([0], [0], color=color, lw=2,
-                          label=f"{name} (media={res['mean']['auc']:.3f})")
+        ax.plot(x_pos, aucs, color=color, lw=2, alpha=0.8)
+        ax.axhline(
+            res["mean"]["auc"],
+            color=color, ls="--", lw=1.2, alpha=0.6,
         )
 
-    ax.legend(handles=clf_handles, loc="lower right", fontsize=9)
+    # Marcadores de BDR debajo del eje X (clip_on=False permite dibujar fuera)
+    for i, sid in enumerate(subj_ids_ordered):
+        bdr    = bdr_map.get(sid, "BDR-")
+        marker = "o" if bdr == "BDR+" else "s"
+        mcolor = "green" if bdr == "BDR+" else "steelblue"
+        ax.scatter(i, -0.06, marker=marker, color=mcolor,
+                   s=80, zorder=5, clip_on=False)
+
+    # Leyenda combinada: clasificadores + estado BDR
+    clf_handles = [
+        mlines.Line2D(
+            [0], [0],
+            color=_COLORS.get(n, "black"), lw=2,
+            label=f"{n} (media = {results[n]['mean']['auc']:.3f})",
+        )
+        for n in results
+    ]
+    bdr_handles = [
+        mlines.Line2D(
+            [0], [0],
+            marker="o", color="w", markerfacecolor="green",
+            markersize=10, label="BDR+",
+        ),
+        mlines.Line2D(
+            [0], [0],
+            marker="s", color="w", markerfacecolor="steelblue",
+            markersize=9, label="BDR-",
+        ),
+    ]
+    ax.legend(handles=clf_handles + bdr_handles, loc="lower right", fontsize=9)
+
     ax.set_xticks(x_pos)
-    ax.set_xticklabels([f"Fold {i}" for i in x_pos])
-    ax.set_xlabel("Fold")
+    ax.set_xticklabels(subj_ids_ordered, rotation=45, ha="right")
+    ax.set_xlabel("Sujeto")
     ax.set_ylabel("AUC")
-    ax.set_ylim([0.0, 1.05])
-    ax.set_title("AUC por fold — StratifiedKFold-5 + SMOTE")
+    ax.set_ylim([-0.1, 1.05])
+    ax.set_title("AUC por sujeto — Validación LOSO")
 
     plt.tight_layout()
-    out = figures_dir / "fig3_cv_auc_per_fold.png"
+    out = figures_dir / "fig3_loso_auc_per_fold.png"
     plt.savefig(out, dpi=150)
     plt.close()
     print(f"  Figura 3 guardada: {out.name}")
@@ -591,38 +618,39 @@ def plot_feature_importance(
     # Re-entrenar RF y XGB sobre el conjunto completo etiquetado
     models_to_plot: list[tuple[str, str, np.ndarray]] = []
 
-    sc_fi = StandardScaler()
-    X_sc_fi = sc_fi.fit_transform(X_labeled)
-
     for name in ["RF", "XGB"]:
         if name not in pipelines:
             continue
 
-        clf = copy.deepcopy(pipelines[name].named_steps["clf"])
-        clf.fit(X_sc_fi, y_labeled)
+        pipe = copy.deepcopy(pipelines[name])
+        pipe.fit(X_labeled, y_labeled)
+        clf      = pipe.named_steps["clf"]
+        selector = pipe.named_steps["selector"]
 
-        # Sin selector: todas las features están disponibles
-        all_names = list(feature_names)
+        # Recuperar los nombres de las 10 features seleccionadas en este fold
+        selected_idx   = selector.get_support(indices=True)
+        selected_names = [feature_names[i] for i in selected_idx]
 
         if name == "RF":
             importances = np.array(clf.feature_importances_, dtype=float)
-            models_to_plot.append((name, "green", importances, all_names))
+            models_to_plot.append((name, "green", importances, selected_names))
 
         elif name == "XGB":
             try:
                 score_dict  = clf.get_booster().get_score(importance_type="total_gain")
-                importances = np.zeros(len(all_names), dtype=float)
+                importances = np.zeros(len(selected_names), dtype=float)
                 for key, val in score_dict.items():
                     if key.startswith("f") and key[1:].isdigit():
                         idx = int(key[1:])
-                        if idx < len(all_names):
+                        if idx < len(selected_names):
                             importances[idx] = float(val)
             except Exception:
                 importances = np.array(
-                    getattr(clf, "feature_importances_", np.zeros(len(all_names))),
+                    getattr(clf, "feature_importances_",
+                            np.zeros(len(selected_names))),
                     dtype=float,
                 )
-            models_to_plot.append((name, "orange", importances, all_names))
+            models_to_plot.append((name, "orange", importances, selected_names))
 
     if not models_to_plot:
         return
@@ -633,14 +661,14 @@ def plot_feature_importance(
         axes = [axes]
 
     for ax, (name, color, importances, feat_names_sel) in zip(axes, models_to_plot):
-        # Top-20 features por importancia
-        order      = np.argsort(importances)[-20:]
-        names_ord  = [feat_names_sel[i] for i in order]
-        vals_ord   = importances[order]
+        # Top-20 de las features seleccionadas por SelectKBest
+        order     = np.argsort(importances)[-20:]
+        names_ord = [feat_names_sel[i] for i in order]
+        vals_ord  = importances[order]
 
         ax.barh(names_ord, vals_ord, color=color, alpha=0.8)
         ax.set_xlabel("Importancia")
-        ax.set_title(f"{name} — {'MDI' if name == 'RF' else 'Total Gain'}  (top-20 de 164)")
+        ax.set_title(f"{name} — {'MDI' if name == 'RF' else 'Total Gain'} (top-20 de 30 sel.)")
         ax.tick_params(axis="y", labelsize=8)
 
     fig.suptitle("Importancia de features", fontsize=13)
@@ -756,27 +784,48 @@ def main() -> None:
 
     # ------------------------------------------------------------------ P3
     print("\n" + "=" * 60)
-    print("PARTE 3 — Validación cruzada (StratifiedKFold-5 + SMOTE)")
+    print("PARTE 3 — Validación LOSO")
     print("=" * 60)
     results: dict[str, dict[str, Any]] = {}
-    print(f"Segmentos etiquetados: {len(y_labeled)}  (usados todos en StratifiedKFold-5)")
+
+    # Identificar sujetos con suficientes señales CAS para entrenar
+    MIN_CAS_TRAIN = 5
+
+    cas_per_subject = {}
+    for sid in np.unique(groups):
+        mask_sid = groups == sid
+        cas_per_subject[sid] = np.sum(y_labeled[mask_sid] == 1)
+
+    valid_subjects = [sid for sid, n in cas_per_subject.items()
+                      if n >= MIN_CAS_TRAIN]
+
+    excluded = {sid: n for sid, n in cas_per_subject.items() if n < MIN_CAS_TRAIN}
+    print(f"Sujetos excluidos del LOSO (< {MIN_CAS_TRAIN} señales CAS):")
+    for sid, n in excluded.items():
+        subj_id = _num_to_subj_id(int(sid))
+        print(f"  {subj_id}: {n} señales CAS → excluido")
+    print(f"Folds LOSO: {len(valid_subjects)}")
+
+    mask_valid = np.isin(groups, valid_subjects)
+    X_loso   = X_labeled[mask_valid]
+    y_loso   = y_labeled[mask_valid]
+    grp_loso = groups[mask_valid]
 
     for name, pipeline in pipelines.items():
         print(f"\n--- {name} ---")
         t0  = time.time()
-        res = run_loso(pipeline, X_labeled, y_labeled, groups, clf_name=name)
+        res = run_loso(pipeline, X_loso, y_loso, grp_loso, clf_name=name)
         elapsed = (time.time() - t0) / 60
         results[name] = res
 
         _save_loso_csv(res["per_fold"], name)
-        print(f"{name} — CV completado en {elapsed:.1f} minutos.")
+        print(f"{name} — LOSO completado en {elapsed:.1f} minutos.")
         print(
-            f"{name}  — Acc: {res['mean']['accuracy']:.3f} ± {res['std']['accuracy']:.3f}"
-            f"  AUC: {res['mean']['auc']:.3f} ± {res['std']['auc']:.3f}"
-            f"  F1: {res['mean']['f1']:.3f} ± {res['std']['f1']:.3f}"
+            f"{name}  — AUC: {res['mean']['auc']:.3f} ± {res['std']['auc']:.3f}"
+            f" | F1: {res['mean']['f1']:.3f} ± {res['std']['f1']:.3f}"
         )
 
-    # ------------------------------------------------------------------ Tabla comparativa
+    # ------------------------------------------------------------------ Tabla comparativa LOSO
     ancho_m = 10
     ancho_v = 13
     sep = "+" + "-" * (ancho_m + 2) + ("+" + "-" * (ancho_v + 2)) * 4 + "+"

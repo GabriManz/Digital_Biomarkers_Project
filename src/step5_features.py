@@ -1,10 +1,16 @@
 """
 Extracción de features de los segmentos respiratorios.
 
-Procesa las 14 900 señales construidas en el paso 4, extrae 15 features
+Procesa las 14 900 señales construidas en el paso 4, extrae 164 features
 por segmento y guarda las matrices resultantes en disco para su uso en
 step6_classification.py. Si el caché existe, lo carga directamente sin
 recomputar.
+
+Grupos de features (164 total):
+  - Temporales      : 16  (RMS, std, varianza, energía, skewness, kurtosis…)
+  - Espectrales     : 13  (centroide, spread, rolloff, flatness, entropía + 5 bandas)
+  - MFCC            : 120 (20 MFCCs × media + std × 3 órdenes: main/delta/delta²)
+  - Wavelet (db4)   : 15  (5 niveles × energía + entropía + std)
 
 Uso:
     python src/step5_features.py
@@ -27,6 +33,8 @@ import scipy.io
 import scipy.signal
 import scipy.stats
 import seaborn as sns
+import librosa
+import pywt
 
 # ---------------------------------------------------------------------------
 # Permite importar módulos vecinos desde src/
@@ -64,7 +72,8 @@ def _find_project_root() -> Path:
 _PROJECT_ROOT = _find_project_root()
 
 FS_TARGET    = 4000
-N_FEATURES   = 15
+N_FEATURES   = 164
+N_MFCC       = 20
 LABEL_CAS    = 2
 LABEL_NO_CAS = 3
 
@@ -74,23 +83,35 @@ DATASET_NPZ  = _PROJECT_ROOT / "outputs" / "results" / "step4" / "dataset.npz"
 CACHE_DIR    = _PROJECT_ROOT / "outputs" / "results" / "step5"
 OUTPUT_FIGS = _PROJECT_ROOT / "outputs" / "figures" / "step5"
 
-FEATURE_NAMES: list[str] = [
-    "rms",
-    "duration_s",
-    "zcr",
-    "kurtosis",
-    "skewness",
-    "tkeo_mean",
-    "freq_dominant",
-    "freq_mean",
-    "band_power_100_1000",
-    "band_power_70_200",
-    "band_power_200_600",
-    "band_power_600_1000",
-    "spectral_entropy",
-    "harmonic_ratio",
-    "sample_entropy",
+_MFCC_NAMES: list[str] = (
+    [f"mfcc{i}_mean"   for i in range(N_MFCC)] +
+    [f"mfcc{i}_std"    for i in range(N_MFCC)] +
+    [f"dmfcc{i}_mean"  for i in range(N_MFCC)] +
+    [f"dmfcc{i}_std"   for i in range(N_MFCC)] +
+    [f"d2mfcc{i}_mean" for i in range(N_MFCC)] +
+    [f"d2mfcc{i}_std"  for i in range(N_MFCC)]
+)
+_WV_NAMES: list[str] = [
+    f"wv_l{lvl}_{stat}"
+    for lvl in range(1, 6)
+    for stat in ("energy", "entropy", "std")
 ]
+FEATURE_NAMES: list[str] = (
+    # --- temporal (16) ---
+    ["t_mean", "t_std", "t_var", "t_rms", "t_maxabs", "t_range",
+     "t_skew", "t_kurt", "t_zcr", "t_crest",
+     "t_entropy", "t_energy", "t_log_energy", "t_var2",
+     "t_hig_mob", "t_hig_comp"] +
+    # --- spectral (13) ---
+    ["s_centroid", "s_spread", "s_rolloff85", "s_flatness", "s_entropy",
+     "s_dom_freq", "s_centroid2", "s_median_freq",
+     "s_bp_70_250", "s_bp_250_500", "s_bp_500_1000",
+     "s_bp_1000_1500", "s_bp_1500_1900"] +
+    # --- MFCC (120) ---
+    _MFCC_NAMES +
+    # --- wavelet (15) ---
+    _WV_NAMES
+)
 # ---------------------------------------------------------------------------
 
 
@@ -137,178 +158,124 @@ def _build_subject_list_local(
 
 
 # ===========================================================================
-# Implementación de sample entropy (sin librerías externas)
+# Normalización robusta por segmento (MAD z-score)
 # ===========================================================================
 
-def _sampen(sig: np.ndarray, m: int, r: float) -> float:
-    """
-    Calcula la sample entropy de una señal discreta.
+def _mad_normalize(sig: np.ndarray) -> np.ndarray:
+    """Normalización robusta: z = (x - mediana) / (1.4826 * MAD)."""
+    med = np.median(sig)
+    mad = np.median(np.abs(sig - med))
+    if mad < 1e-12:
+        return sig - med
+    return (sig - med) / (1.4826 * mad)
 
-    Parámetros
-    ----------
-    sig : np.ndarray
-        Señal 1D (ya submuestreada si es necesario).
-    m : int
-        Longitud del template.
-    r : float
-        Tolerancia (umbral de similitud).
 
-    Retorna
-    -------
-    float
-        Valor de sample entropy. Devuelve 0 si no hay coincidencias.
-    """
-    N = len(sig)
-
-    def _count_matches(template_len: int) -> int:
-        count = 0
-        for i in range(N - template_len):
-            template = sig[i : i + template_len]
-            for j in range(i + 1, N - template_len):
-                if np.max(np.abs(sig[j : j + template_len] - template)) <= r:
-                    count += 1
-        return count
-
-    B = _count_matches(m)
-    A = _count_matches(m + 1)
-    if B == 0:
-        return 0.0
-    return -np.log(A / B) if A > 0 else 0.0
+def _safe(seg: np.ndarray, mn: int = 2048) -> np.ndarray:
+    """Rellena con ceros hasta longitud mínima y devuelve float64."""
+    if len(seg) < mn:
+        seg = np.pad(seg, (0, mn - len(seg)))
+    return seg.astype(np.float64)
 
 
 # ===========================================================================
-# Extracción de features
+# Grupos de features (igual que Adria/classification.py)
+# ===========================================================================
+
+def _feat_temporal(s: np.ndarray) -> list[float]:
+    """16 features temporales: estadísticos, energía, complejidad de Higuchi."""
+    s   = _safe(s)
+    rms = np.sqrt(np.mean(s ** 2))
+    d1  = np.diff(s); d2 = np.diff(d1)
+    v   = np.var(s)
+    hm  = np.sqrt(np.var(d1) / (v + 1e-12))
+    prob = s ** 2 / (np.sum(s ** 2) + 1e-12)
+    return [
+        float(np.mean(s)), float(np.std(s)), float(v), float(rms),
+        float(np.max(np.abs(s))), float(np.max(s) - np.min(s)),
+        float(pd.Series(s).skew()), float(pd.Series(s).kurt()),
+        float(np.sum(np.abs(np.diff(np.sign(s))) > 0) / len(s)),
+        float(np.max(np.abs(s)) / (rms + 1e-12)),
+        float(-np.sum(prob * np.log(prob + 1e-12))),
+        float(np.sum(s ** 2)), float(np.log(np.sum(s ** 2) + 1e-12)),
+        float(v), float(hm),
+        float(np.sqrt(np.var(d2) / (np.var(d1) + 1e-12)) / (hm + 1e-12)),
+    ]
+
+
+def _feat_spectral(s: np.ndarray, fs: int = FS_TARGET) -> list[float]:
+    """13 features espectrales: centroide, spread, rolloff, bandas de potencia."""
+    s  = _safe(s)
+    f, p = scipy.signal.welch(s, fs=fs, nperseg=min(512, len(s)))
+    tp = float(np.sum(p)) + 1e-12
+    pn = p / tp
+    sc = float(np.sum(f * pn))
+    feats = [
+        sc,
+        float(np.sqrt(np.sum(((f - sc) ** 2) * pn))),
+        float(f[np.searchsorted(np.cumsum(pn), 0.85)]),
+        float(np.exp(np.mean(np.log(p + 1e-12))) / (np.mean(p) + 1e-12)),
+        float(-np.sum(pn * np.log(pn + 1e-12))),
+        float(f[np.argmax(p)]),
+        sc,
+        float(f[np.searchsorted(np.cumsum(pn), 0.50)]),
+    ]
+    for lo, hi in [(70, 250), (250, 500), (500, 1000), (1000, 1500), (1500, 1900)]:
+        feats.append(float(np.sum(p[(f >= lo) & (f < hi)]) / tp))
+    return feats   # 13
+
+
+def _feat_mfcc(s: np.ndarray, fs: int = FS_TARGET) -> list[float]:
+    """120 features MFCC: 20 coeficientes × (media+std) × (main+delta+delta²)."""
+    s  = _safe(s, 2048).astype(np.float32)
+    m  = librosa.feature.mfcc(y=s, sr=fs, n_mfcc=N_MFCC)
+    nf = m.shape[1]
+    w  = min(9, nf if nf % 2 == 1 else max(nf - 1, 1))
+    w  = max(w, 3)
+    mo = "interp" if nf >= w else "nearest"
+    d  = librosa.feature.delta(m, width=w, mode=mo)
+    d2 = librosa.feature.delta(m, width=w, mode=mo, order=2)
+    return (
+        list(np.mean(m, 1).astype(float)) + list(np.std(m, 1).astype(float)) +
+        list(np.mean(d, 1).astype(float)) + list(np.std(d, 1).astype(float)) +
+        list(np.mean(d2, 1).astype(float)) + list(np.std(d2, 1).astype(float))
+    )   # 120
+
+
+def _feat_wavelet(s: np.ndarray) -> list[float]:
+    """15 features wavelet: db4 nivel 5, energía + entropía + std por nivel."""
+    s      = _safe(s)
+    coeffs = pywt.wavedec(s, "db4", level=5)
+    out: list[float] = []
+    for c in coeffs[1:]:
+        e    = float(np.sum(c ** 2))
+        prob = c ** 2 / (e + 1e-12)
+        out.extend([e, float(-np.sum(prob * np.log(prob + 1e-12))), float(np.std(c))])
+    return out   # 15
+
+
+# ===========================================================================
+# Extracción de features (función pública)
 # ===========================================================================
 
 def extract_features(signal: np.ndarray, fs: int = FS_TARGET) -> np.ndarray:
     """
-    Extrae exactamente 15 features de un segmento de señal respiratoria.
+    Extrae 164 features de un segmento de señal respiratoria.
 
-    Parámetros
-    ----------
-    signal : np.ndarray
-        Segmento 1D a frecuencia de muestreo fs.
-    fs : int
-        Frecuencia de muestreo (Hz).
-
-    Retorna
-    -------
-    np.ndarray
-        Array float64 de forma (15,) con los valores de cada feature en el
-        orden definido por FEATURE_NAMES. NaN e Inf se sustituyen por 0.
+    Aplica normalización MAD robusta antes de la extracción para eliminar
+    diferencias de escala entre sujetos. Retorna un array float64 (164,).
+    NaN e Inf se sustituyen por 0.
     """
-    feats = np.zeros(N_FEATURES, dtype=np.float64)
-    n = len(signal)
+    sig = _mad_normalize(np.asarray(signal, dtype=np.float64))
 
-    # ------------------------------------------------------------------
-    # 1. RMS
-    # ------------------------------------------------------------------
-    feats[0] = np.sqrt(np.mean(signal ** 2))
+    feats = (
+        _feat_temporal(sig) +       # 16
+        _feat_spectral(sig, fs) +   # 13
+        _feat_mfcc(sig, fs) +       # 120
+        _feat_wavelet(sig)          # 15
+    )                               # = 164
 
-    # ------------------------------------------------------------------
-    # 2. Duración en segundos
-    # ------------------------------------------------------------------
-    feats[1] = n / fs
-
-    # ------------------------------------------------------------------
-    # 3. Zero-crossing rate
-    # ------------------------------------------------------------------
-    feats[2] = np.sum(np.abs(np.diff(np.sign(signal + 1e-10)))) / (2 * n)
-
-    # ------------------------------------------------------------------
-    # 4. Curtosis (Fisher, media cero para distribución normal)
-    # ------------------------------------------------------------------
-    feats[3] = float(scipy.stats.kurtosis(signal, fisher=True))
-
-    # ------------------------------------------------------------------
-    # 5. Asimetría (skewness)
-    # ------------------------------------------------------------------
-    feats[4] = float(scipy.stats.skew(signal))
-
-    # ------------------------------------------------------------------
-    # 6. TKEO medio
-    # ------------------------------------------------------------------
-    if n >= 3:
-        tkeo = signal[1:-1] ** 2 - signal[:-2] * signal[2:]
-        feats[5] = np.mean(np.abs(tkeo))
-    else:
-        feats[5] = 0.0
-
-    # ------------------------------------------------------------------
-    # Welch PSD — se calcula una única vez y se reutiliza en features 7–14
-    # ------------------------------------------------------------------
-    nperseg = min(256, n)
-    f, psd = scipy.signal.welch(signal, fs, nperseg=nperseg)
-    total_power = np.sum(psd) + 1e-12   # evitar división por cero
-
-    # ------------------------------------------------------------------
-    # 7. Frecuencia dominante (restringida a 70–2000 Hz para evitar
-    #    que el componente DC o derivas de baja frecuencia dominen)
-    # ------------------------------------------------------------------
-    mask_valid = (f >= 70) & (f <= 2000)
-    f_dom = float(f[mask_valid][np.argmax(psd[mask_valid])]) if np.any(mask_valid) else 0.0
-    feats[6] = f_dom
-
-    # ------------------------------------------------------------------
-    # 8. Frecuencia media (banda 70–2000 Hz)
-    # ------------------------------------------------------------------
-    mask_band = (f >= 70) & (f <= 2000)
-    f_band  = f[mask_band]
-    psd_band = psd[mask_band]
-    band_sum = np.sum(psd_band) + 1e-12
-    feats[7] = float(np.sum(f_band * psd_band) / band_sum)
-
-    # ------------------------------------------------------------------
-    # 9–12. Potencias de banda (fracción sobre potencia total)
-    # ------------------------------------------------------------------
-    feats[8]  = np.sum(psd[(f >= 100) & (f <= 1000)]) / total_power
-    feats[9]  = np.sum(psd[(f >= 70)  & (f <= 200)])  / total_power
-    feats[10] = np.sum(psd[(f >= 200) & (f <= 600)])  / total_power
-    feats[11] = np.sum(psd[(f >= 600) & (f <= 1000)]) / total_power
-
-    # ------------------------------------------------------------------
-    # 13. Entropía espectral (normalizada a [0, 1])
-    # ------------------------------------------------------------------
-    psd_norm = psd / total_power
-    H = -np.sum(psd_norm * np.log2(psd_norm + 1e-12))
-    feats[12] = H / np.log2(len(psd)) if len(psd) > 1 else 0.0
-
-    # ------------------------------------------------------------------
-    # 14. Harmonic ratio — energía en armónicos 1, 2, 3 de f_dom
-    # ------------------------------------------------------------------
-    if f_dom > 0:
-        harmonic_energy = 0.0
-        valid = True
-        for k in range(1, 4):
-            f_k = k * f_dom
-            mask_k = (f >= f_k - 5) & (f <= f_k + 5)
-            if not np.any(mask_k):
-                valid = False
-                break
-            harmonic_energy += np.sum(psd[mask_k])
-        feats[13] = (harmonic_energy / total_power) if valid else 0.0
-    else:
-        feats[13] = 0.0
-
-    # ------------------------------------------------------------------
-    # 15. Sample entropy (submuestro a máx. 400 puntos para velocidad)
-    #     La tolerancia r se calcula sobre la señal submuestreada, no
-    #     sobre la original, para calibrarla respecto a los datos reales
-    #     que _sampen va a comparar.
-    # ------------------------------------------------------------------
-    if np.std(signal) == 0.0 or n < 50:
-        feats[14] = 0.0
-    else:
-        step = max(1, n // 400)
-        sig_sub = signal[::step]
-        r_tol = 0.2 * np.std(sig_sub)
-        feats[14] = _sampen(sig_sub, m=2, r=r_tol)
-
-    # ------------------------------------------------------------------
-    # Sanear NaN e Inf
-    # ------------------------------------------------------------------
-    feats = np.nan_to_num(feats, nan=0.0, posinf=0.0, neginf=0.0)
-    return feats
+    arr = np.array(feats, dtype=np.float64)
+    return np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
 
 
 # ===========================================================================
@@ -437,13 +404,14 @@ def _generate_figures(X_labeled: np.ndarray, y_labeled: np.ndarray) -> None:
     df["clase"] = np.where(mask_cas, "CAS", "NO CAS")
 
     # ------------------------------------------------------------------
-    # Figura 1 — Distribuciones KDE: CAS vs NO CAS (3×5 subplots)
+    # Figura 1 — Distribuciones KDE: CAS vs NO CAS (4×5 subplots, primeras 20)
     # ------------------------------------------------------------------
-    print("\nGenerando figura 1: distribuciones de features...")
-    fig, axes = plt.subplots(3, 5, figsize=(20, 12))
+    print("\nGenerando figura 1: distribuciones de features (primeras 20)...")
+    feat_show = FEATURE_NAMES[:20]
+    fig, axes = plt.subplots(4, 5, figsize=(20, 14))
     axes_flat = axes.flatten()
 
-    for idx, feat in enumerate(FEATURE_NAMES):
+    for idx, feat in enumerate(feat_show):
         ax = axes_flat[idx]
         sns.kdeplot(
             data=df, x=feat, hue="clase",
@@ -451,10 +419,14 @@ def _generate_figures(X_labeled: np.ndarray, y_labeled: np.ndarray) -> None:
             fill=True, alpha=0.6, ax=ax,
             legend=(idx == 0),
         )
-        ax.set_title(feat, fontsize=10)
+        ax.set_title(feat, fontsize=9)
         ax.set_xlabel("")
 
-    fig.suptitle("Distribucion de features — CAS vs NO CAS", fontsize=14, y=1.01)
+    for ax in axes_flat[len(feat_show):]:
+        ax.set_visible(False)
+
+    fig.suptitle("Distribucion de features (primeras 20 de 164) — CAS vs NO CAS",
+                 fontsize=13, y=1.01)
     plt.tight_layout()
     out1 = OUTPUT_FIGS / "fig1_feature_distributions.png"
     plt.savefig(out1, dpi=150, bbox_inches="tight")
@@ -462,19 +434,20 @@ def _generate_figures(X_labeled: np.ndarray, y_labeled: np.ndarray) -> None:
     print(f"  Guardada: {out1}")
 
     # ------------------------------------------------------------------
-    # Figura 2 — Matriz de correlación 15×15
+    # Figura 2 — Matriz de correlación (primeras 30 features)
     # ------------------------------------------------------------------
-    print("Generando figura 2: matriz de correlacion...")
-    corr = pd.DataFrame(X_labeled, columns=FEATURE_NAMES).corr()
+    print("Generando figura 2: matriz de correlacion (primeras 30 features)...")
+    feat_corr = FEATURE_NAMES[:30]
+    corr = pd.DataFrame(X_labeled[:, :30], columns=feat_corr).corr()
 
-    fig, ax = plt.subplots(figsize=(12, 10))
+    fig, ax = plt.subplots(figsize=(14, 12))
     sns.heatmap(
         corr, annot=False, cmap="coolwarm",
         vmin=-1, vmax=1,
-        xticklabels=FEATURE_NAMES, yticklabels=FEATURE_NAMES,
+        xticklabels=feat_corr, yticklabels=feat_corr,
         ax=ax,
     )
-    ax.set_title("Matriz de correlacion de features", fontsize=13)
+    ax.set_title("Matriz de correlacion (primeras 30 de 164 features)", fontsize=12)
     plt.tight_layout()
     out2 = OUTPUT_FIGS / "fig2_feature_correlation.png"
     plt.savefig(out2, dpi=150, bbox_inches="tight")

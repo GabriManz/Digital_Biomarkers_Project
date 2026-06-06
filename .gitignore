@@ -1,6 +1,11 @@
 # Project data and generated artifacts
 Data/
 
+# Adria preprocessed signals (>100 MB — excluded from GitHub)
+Adria/preprocessed/signals.pkl
+Adria/preprocessed/signals_padded.npy
+Adria/preprocessed/lengths.npy
+
 # Python cache and bytecode
 __pycache__/
 *.py[cod]

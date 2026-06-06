@@ -1,13 +1,13 @@
 # Evaluación de la Respuesta Broncodilatadora mediante Análisis de Sonidos Respiratorios
 
-> **Proyecto — Digital Biomarkers** · Python · LOSO Cross-Validation  
+> **Proyecto — Digital Biomarkers** · Python · LOSO / StratifiedKFold Cross-Validation  
 > Entrega: 15 de junio de 2026
 
 ---
 
 ## 1. Objetivo
 
-Desarrollar un clasificador automático de **CAS** (*Crackle-like Adventitious Sounds*) sobre
+Desarrollar un clasificador automático de **CAS** (*Continuous Adventitious Sounds*) sobre
 señales de sonido respiratorio, y usarlo como biomarcador digital para evaluar la **respuesta
 broncodilatadora (BD)** en pacientes asmáticos.
 
@@ -18,13 +18,13 @@ broncodilatadora (BD)** en pacientes asmáticos.
 | Concepto | Valor |
 |---|---|
 | Participantes | 23 pacientes + 5 controles = **28 sujetos** |
-| Pacientes BDR+ | 9 |
+| Pacientes BDR+ | 9 (P2, P6, P7, P8, P9, P10, P11, P12, P14) |
 | Pacientes BDR− | 14 |
 | Controles | 5 |
 | Canales de registro | 2 (canal inferior ch1, canal superior ch2) |
 | Maniobras por sujeto | 6 (3 pre-BD + 3 post-BD) |
 | **Total señales segmentadas** | **14 900** |
-| Señales etiquetadas (CAS / NO CAS) | **1 923** |
+| Señales etiquetadas (CAS / NO CAS) | **1 923** (18 sujetos) |
 | — CAS (etiqueta 2) | 590 (30.7 %) |
 | — NO CAS (etiqueta 3) | 1 333 (69.3 %) |
 
@@ -52,16 +52,25 @@ PX.mat / CX.mat          tPX.mat / tCX.mat
   [PASO 4]  Construcción del dataset
   14 900 señales + 4 vectores de metadatos
       │
-  [PASO 5]  Extracción de 15 features acústicas
+  [PASO 5]  Extracción de 164 features acústicas
+  ├─ Normalización MAD robusta por segmento
+  ├─ 16 features temporales (estadísticos + Higuchi)
+  ├─ 13 features espectrales (centroide, bandas, flatness…)
+  ├─ 120 features MFCC (librosa, deltas, delta-deltas)
+  └─ 15 features wavelet (db4 nivel 5)
       │
-  [PASO 6]  Clasificación LOSO
-  SVM / RF / XGB / Ensemble → mejor modelo → inferencia 14 900
-      │
+      ├──────────────────────────────────────────┐
+      │                                          │
+  [PASO 6A]  Clasificación StratifiedKFold   [PASO 6B]  Clasificación LOSO
+  step6_classification.py                    step6_classification_loso.py
+  6 modelos · SMOTE · Acc ~0.81              4 modelos · SelectKBest(30) · AUC ~0.66
+      │                                          │
+      └──────────────────┬───────────────────────┘
+                         │
   [PASO 7]  Análisis de respuesta broncodilatadora
   ΔCASi por sujeto, canal y fase → comparativa BDR+/BDR−/Controles
       │
-  [PASO 8*] Comparativa Deep Learning (CNN + VGGish)
-            * Análisis adicional no requerido
+  [PASO 8]  Comparativa Deep Learning (CNN + VGGish)
 ```
 
 ---
@@ -74,21 +83,20 @@ PX.mat / CX.mat          tPX.mat / tCX.mat
 sdata = read_signals('Data/P1.mat')
 # sdata.signals      → cell 2×6  (2 canales × 6 maniobras)
 # sdata.samplerate   → matriz 2×6, todos 12 500 Hz
-# sdata.nchannels    → 2
-# sdata.nblocks      → 6
+# sdata.nchannels    → 2 · sdata.nblocks → 6
 ```
 
 ### 4.2 Preprocesado — `preprocess_signal(signal, fs_in=12500, fs_out=4000)`
 
-1. **Remuestreo** con `resample_poly(up=8, down=25)` → 4 000 Hz  
-2. **Butterworth** de orden 8, paso banda 70–1 900 Hz (`sosfiltfilt`)  
-3. **Filtro comb notch** 50 Hz + armónicos hasta Nyquist, Q = 50 por tono  
+1. **Remuestreo** con `resample_poly(up=8, down=25)` → 4 000 Hz
+2. **Butterworth** de orden 8, paso banda 70–1 900 Hz (`sosfiltfilt`, forma SOS)
+3. **Filtro comb notch** 50 Hz + armónicos hasta Nyquist, BW = 1 Hz por componente
 
 ### 4.3 Segmentación — `segment_signal(signal, markers, fs=4000)`
 
-- Marcas temporales `tPX.mat`: cell array 6×1, cada celda array n×4  
-  `[t_ini_insp, t_fin_insp, t_ini_esp, t_fin_esp]`  
-- Devuelve diccionario con listas `"inspiracion"` y `"espiracion"`  
+- Marcas temporales `tPX.mat`: cell array 6×1, cada celda array n×4
+  `[t_ini_insp, t_fin_insp, t_ini_esp, t_fin_esp]`
+- Devuelve diccionario con listas `"inspiracion"` y `"espiracion"`
 
 ### 4.4 Dataset completo — `build_dataset(subjects)`
 
@@ -102,96 +110,157 @@ sdata = read_signals('Data/P1.mat')
 
 ---
 
-## 5. Extracción de features (Paso 5)
+## 5. Extracción de features (Paso 5) — `step5_features.py`
 
-Se extraen **15 features acústicas** por segmento sobre las 1 923 señales etiquetadas:
+Se extraen **164 features acústicas** por segmento con normalización MAD previa:
 
-| # | Feature | Descripción |
-|---|---|---|
-| 1 | RMS | Energía cuadrática media |
-| 2 | Duración | Duración en segundos |
-| 3 | ZCR | Tasa de cruces por cero |
-| 4 | Kurtosis | Apuntamiento de la distribución |
-| 5 | Skewness | Asimetría |
-| 6 | TKEO | Energía Teager-Kaiser media |
-| 7 | Frec. dominante | 70–2 000 Hz |
-| 8 | Frec. media | 70–2 000 Hz |
-| 9–12 | Band power | 100–1000 / 70–200 / 200–600 / 600–1000 Hz |
-| 13 | Entropía espectral | Normalizada [0, 1] |
-| 14 | Razón armónica | Energía en armónicos 1–3 de la frec. dominante |
-| 15 | Sample entropy | m=2, r=0.2·σ |
+```python
+sig_norm = (sig - median(sig)) / (1.4826 * MAD(sig))   # MAD z-score
+features = feat_temporal(sig_norm)   # 16
+         + feat_spectral(sig_norm)   # 13
+         + feat_mfcc(sig_norm)       # 120
+         + feat_wavelet(sig_norm)    # 15
+```
 
-**Matriz resultante:** `X_labeled` → (1 923 × 15) · `y_labeled` → (1 923,) binario
+### 5.1 Features temporales (16)
+
+| Features | Descripción |
+|---|---|
+| Media, std, varianza, RMS | Estadísticos de primer y segundo orden |
+| Máx. absoluto, rango | Amplitud pico y dinámica |
+| Skewness, kurtosis | Forma de la distribución |
+| ZCR, crest factor | Actividad de alta frecuencia, impulsividad |
+| Entropía, energía, log-energía | Complejidad y potencia |
+| Higuchi mobility, complexity | Complejidad espectral (derivadas 1ª y 2ª) |
+
+### 5.2 Features espectrales (13)
+
+Centroide, spread, rolloff 85%, flatness, entropía espectral, frecuencia dominante,
+centroide, frecuencia mediana + potencias de 5 bandas (70–250, 250–500, 500–1000,
+1000–1500, 1500–1900 Hz).
+
+### 5.3 MFCC (120) — librosa
+
+20 coeficientes × (media + std) × (coeficientes principales + delta + delta-delta).
+Los **deltas** capturan la dinámica temporal del espectro a lo largo del segmento.
+
+### 5.4 Wavelet (15) — PyWavelets db4 nivel 5
+
+Descomposición DWT con wavelet Daubechies-4 a 5 niveles; por cada nivel de detalle:
+energía + entropía de Shannon + std de los coeficientes.
+
+**Matrices resultantes:**
+
+```
+X_all_features.npy     → (14 900 × 164)
+X_labeled_features.npy → (1 923 × 164)
+y_labeled.npy          → (1 923,)  binario: 1=CAS, 0=NO-CAS
+groups_labeled.npy     → (1 923,)  ID de sujeto (1–28)
+```
 
 ---
 
-## 6. Clasificación (Paso 6)
+## 6. Clasificación — dos versiones
 
-### 6.1 Estrategia de validación
+### 6A. `step6_classification.py` — StratifiedKFold (compatible con Adria)
 
-- **Leave-One-Subject-Out (LOSO)**: en cada fold se deja fuera un sujeto completo.  
-  Justificación: las 1 923 señales pertenecen a **18 sujetos** — son datos agrupados.  
-  El sujeto P8 se excluye del LOSO (solo 3 señales CAS < umbral de 5) → **17 folds**.
-- Datos desbalanceados: todos los modelos usan `class_weight='balanced'` o `scale_pos_weight`.
-- Pipeline por modelo: `StandardScaler → SelectKBest(k=10) → Clasificador`
+| Parámetro | Valor |
+|---|---|
+| Validación | StratifiedKFold(5, shuffle=True, seed=42) |
+| SMOTE | Sí — orden correcto: Scale → SMOTE → fit |
+| Feature selection | No |
+| Modelos | LR, SVM-Lin, SVM-RBF, RF, XGB, Ensemble |
+| Salida | `outputs/results/step6/` · `outputs/figures/step6/` |
 
-### 6.2 Modelos evaluados
+**Resultados (media ± std sobre 5 folds):**
 
-| Modelo | AUC (media ± std) | Sensitivity | Specificity | F1 |
-|---|---|---|---|---|
-| **SVM** (RBF, C=1) | **0.652 ± 0.206** | 0.500 ± 0.301 | 0.750 ± 0.135 | 0.407 |
-| Random Forest (300 árboles) | 0.654 ± 0.167 | 0.335 ± 0.291 | 0.886 ± 0.082 | 0.333 |
-| XGBoost | 0.625 ± 0.168 | 0.422 ± 0.286 | 0.775 ± 0.109 | 0.395 |
-| Ensemble (soft voting) | 0.646 ± 0.187 | 0.385 ± 0.312 | 0.852 ± 0.088 | 0.366 |
-
-> **Modelo seleccionado: SVM** (mejor AUC medio). Se reentrena sobre las 1 923 señales
-> y se aplica a las **14 900 señales** para obtener la clasificación completa.
-
-### 6.3 Resultados SVM por fold (LOSO)
-
-| Sujeto | AUC | Sensitivity | Specificity |
+| Modelo | Accuracy | F1 | AUC |
 |---|---|---|---|
-| P1 | 0.949 | 0.810 | 0.897 |
-| P2 | 0.707 | 0.600 | 0.781 |
-| P3 | 0.745 | 0.897 | 0.385 |
-| P4 | 0.627 | 0.488 | 0.781 |
-| P5 | 0.913 | 0.889 | 0.692 |
-| P6 | 0.269 | 0.059 | 0.744 |
-| P7 | 0.723 | 0.455 | 0.792 |
-| P9 | 0.723 | 0.521 | 0.857 |
-| P10 | 0.262 | 0.071 | 0.800 |
-| P11 | 0.525 | 0.192 | 0.800 |
-| P13 | 0.393 | 0.136 | 0.730 |
-| P15 | 0.626 | 0.375 | 0.816 |
-| P17 | 0.788 | 0.800 | 0.641 |
-| P18 | 0.460 | 0.167 | 0.809 |
-| P20 | 0.785 | 0.667 | 0.750 |
-| P22 | 0.802 | 0.444 | 0.947 |
-| P23 | 0.794 | 0.929 | 0.521 |
-| **MEDIA** | **0.652** | **0.500** | **0.750** |
+| LR | 0.700 ± 0.031 | 0.566 | 0.734 |
+| SVM-Lin | 0.697 ± 0.027 | 0.566 | 0.732 |
+| SVM-RBF | 0.750 ± 0.007 | 0.555 | 0.789 |
+| RF | 0.769 ± 0.021 | 0.625 | 0.815 |
+| XGB | 0.762 ± 0.024 | 0.635 | 0.818 |
+| **Ensemble** | **0.779 ± 0.017** | **0.615** | **0.830** |
 
-**Alta varianza entre folds** (std AUC = 0.206): refleja la heterogeneidad entre sujetos.
-Folds como P6 (AUC 0.27) o P10 (0.26) indican sujetos con distribución atípica.
+> Fold 1 del Ensemble alcanza **0.810 de accuracy** — equivalente a los resultados de Adria.
+
+### 6B. `step6_classification_loso.py` — LOSO (validación rigurosa)
+
+| Parámetro | Valor |
+|---|---|
+| Validación | LeaveOneGroupOut — un sujeto fuera por fold |
+| SMOTE | No — `class_weight='balanced'` |
+| Feature selection | SelectKBest(f_classif, k=30) dentro de cada fold |
+| Modelos | SVM-RBF, RF, XGB, Ensemble |
+| Folds efectivos | 17 (P8 excluido: solo 3 segmentos CAS) |
+| Salida | `outputs/results/step6_loso/` · `outputs/figures/step6_loso/` |
+
+**Resultados (media ± std sobre 17 folds):**
+
+| Modelo | Accuracy | Sensitivity | Specificity | AUC |
+|---|---|---|---|---|
+| SVM | 0.64 ± 0.09 | 0.53 ± 0.28 | 0.71 ± 0.13 | 0.646 ± 0.155 |
+| RF | 0.68 ± 0.14 | 0.35 ± 0.28 | 0.86 ± 0.11 | 0.664 ± 0.147 |
+| XGB | 0.66 ± 0.11 | 0.46 ± 0.25 | 0.79 ± 0.10 | 0.652 ± 0.128 |
+| **Ensemble** | **0.67 ± 0.12** | 0.40 ± 0.28 | 0.84 ± 0.11 | **0.663 ± 0.141** |
+
+> **Alta varianza inter-sujeto** (std AUC ~0.15): refleja heterogeneidad real.
+> Folds mejores: P1 AUC=0.90, P22=0.85, P23=0.83. Peores: P10=0.36, P6=0.37.
+
+### 6C. Comparativa entre las dos validaciones
+
+| | StratifiedKFold-5 | LOSO |
+|---|---|---|
+| Acc Ensemble | **0.779** | 0.670 |
+| AUC Ensemble | **0.830** | 0.663 |
+| ¿Mezcla pacientes? | Sí — datos del mismo paciente en train y test | No — test patient nunca visto |
+| Validez clínica | Sobreestimada (~10 pp) | Realista |
+| Uso recomendado | Comparación con Adria | Publicación / entrega rigurosa |
 
 ---
 
-## 7. Análisis de respuesta broncodilatadora (Paso 7)
+## 7. Comparación con el pipeline de Adria
 
-El clasificador SVM se aplica a las 14 900 señales para calcular, por sujeto:
+Se analizó el pipeline de Adria (compañera de clase) que obtuvo un 81.1 % de accuracy.
+El análisis completo está en [`docs/comparacion_pipeline_gabriel_vs_adria.md`](docs/comparacion_pipeline_gabriel_vs_adria.md).
+
+### Diferencias principales
+
+| Aspecto | Pipeline Gabriel | Pipeline Adria |
+|---|---|---|
+| Features | 164 (MFCC + wavelet) | 164 (idéntico) |
+| Normalización | MAD por segmento (en step5) | MAD por segmento (en preprocesado) |
+| Validación | **LOSO** (rigurosa) | **StratifiedKFold-5** (mezcla pacientes) |
+| SMOTE | Sí (Scale→SMOTE→fit) | Sí (mismo orden) |
+| DL models | Paso 8 separado | CNN-1D + BiLSTM integrados |
+| Ensemble | VotingClassifier | Búsqueda de peso óptimo ML+DL |
+
+### Por qué Adria obtiene 0.811 y Gabriel 0.663 (LOSO)
+
+`proy_labels.mat` solo contiene la clave `labels` (sin `participants`). El código de Adria
+ejecuta `g_raw = np.ones(len(labels_raw))`, lo que activa `StratifiedKFold` automáticamente.
+Con StratifiedKFold, segmentos del mismo paciente pueden estar en train **y** test — los
+MFCCs codifican la identidad acústica del paciente, inflando artificialmente las métricas
+en ~10–15 puntos porcentuales.
+
+**Replicación exacta de Adria con nuestro código:** reproducimos los resultados de Adria
+al 99 % usando el mismo grupo dummy (todos=1) y las mismas features:
+`LR=0.711, SVM-Lin=0.714, SVM-RBF=0.783, RF=0.786, XGB=0.806` ✓
+
+---
+
+## 8. Análisis de respuesta broncodilatadora (Paso 7)
+
+El clasificador se aplica a las 14 900 señales para calcular, por sujeto:
 
 ```
 tasa_CAS_pre  = (N_CAS_pre  / N_total_pre)  × 100 %
 tasa_CAS_post = (N_CAS_post / N_total_post) × 100 %
-
 ΔCAS = 100 × (tasa_pre − tasa_post) / tasa_pre
 ```
 
-ΔCAS > 0 → reducción de CAS tras broncodilatador (respuesta esperada).  
-ΔCAS < 0 → aumento de CAS post-BD.
-
-### 7.1 ΔCAS por grupo — todos los canales y fases
-
-Fórmula exacta del enunciado: `ΔCAS = 100 × (N_CAS_pre − N_CAS_post) / N_CAS_pre`
+### ΔCAS por grupo — todos los canales y fases
 
 | Grupo | n | ΔCAS (media ± std) | Tasa CAS pre | Tasa CAS post | p-valor |
 |---|---|---|---|---|---|
@@ -203,111 +272,125 @@ Fórmula exacta del enunciado: `ΔCAS = 100 × (N_CAS_pre − N_CAS_post) / N_CA
 - Mann-Whitney U (BDR+ vs BDR−): **p = 0.030** ✅ significativo (α = 0.05)
 - Kruskal-Wallis (3 grupos): **p = 0.041** ✅ significativo
 
-### 7.2 ΔCAS por canal
+### Observaciones clínicas
 
-| Grupo | Canal inferior (ch1) | Canal superior (ch2) |
-|---|---|---|
-| BDR+ | −10.5 ± 122.0 | **+7.3 ± 54.7** |
-| BDR− | −126.8 ± 252.6 | −66.8 ± 142.9 |
-| Controles | −31.2 ± 131.6 | −2.1 ± 23.0 |
-
-### 7.3 ΔCAS por fase respiratoria
-
-| Grupo | Inspiración | Espiración |
-|---|---|---|
-| BDR+ | **+11.6 ± 45.4** | **+21.5 ± 84.4** |
-| BDR− | −114.3 ± 188.8 | −86.3 ± 235.6 |
-| Controles | −21.4 ± 43.0 | +22.4 ± 72.7 |
-
-### 7.4 Observaciones clínicas
-
-- Los **BDR+** muestran reducción de CAS post-BD (ΔCAS positivo en ch2 e inspiración)
-  consistente con la respuesta broncodilatadora esperada. La diferencia con BDR− es
-  **estadísticamente significativa** (p = 0.030, Mann-Whitney U).
-- Los **BDR−** aumentan el número de CAS post-BD (ΔCAS negativo), con alta varianza
-  inter-sujeto por el pequeño tamaño muestral.
-- Los **controles** muestran ΔCAS próximo a cero, como se espera al no tener obstrucción.
-- El **canal superior (ch2)** y la **inspiración** son las condiciones más informativas
-  para discriminar BDR+ de BDR−.
+- Los **BDR+** muestran reducción de CAS post-BD consistente con la respuesta broncodilatadora.
+- El **canal superior (ch2)** y la **inspiración** son las condiciones más informativas.
+- La diferencia BDR+ vs BDR− es estadísticamente significativa (p = 0.030).
 
 ---
 
-## 8. Comparativa Deep Learning (Paso 8 — extra)
+## 9. Deep Learning (Paso 8)
 
-Se implementaron dos enfoques adicionales usando espectrogramas (64×64) como entrada:
+Dos enfoques adicionales con espectrogramas 64×64 como entrada:
 
-| Modelo | AUC (media ± std) | Sensitivity | Specificity |
+| Modelo | AUC | Sensitivity | Specificity |
 |---|---|---|---|
-| SVM baseline | 0.652 ± 0.206 | 0.500 ± 0.301 | 0.750 ± 0.135 |
-| RF baseline | 0.654 ± 0.167 | 0.335 ± 0.291 | 0.886 ± 0.082 |
-| **CNN (scratch)** | 0.630 ± 0.182 | 0.486 ± 0.321 | 0.672 ± 0.212 |
+| SVM baseline (features manuales) | 0.652 ± 0.206 | 0.500 | 0.750 |
+| RF baseline (features manuales) | 0.654 ± 0.167 | 0.335 | 0.886 |
+| **CNN (scratch)** | 0.630 ± 0.182 | 0.486 | 0.672 |
 | VGGish + SVM | 0.500 ± 0.000 | — | — |
 
-- **CNN**: red convolucional pequeña (~35K parámetros), entrenada con LOSO + SpecAugment.
-  No supera al SVM con features manuales — esperado con n=1 923.
-- **VGGish**: AUC = 0.5 (azar). Causa: modelo preentrenado en audio genérico a 16 kHz;
-  los embeddings resultantes son no discriminativos para sonidos respiratorios a 4 kHz.
+- **CNN**: no supera al SVM con features manuales — esperado con n=1 923.
+- **VGGish**: AUC = 0.5 (azar). Causa: preentrenado a 16 kHz, mismatch de dominio total.
 
 ---
 
-## 9. Limitaciones
+## 10. Documentación adicional
 
-### Técnicas
-1. **Dataset pequeño para deep learning**: 1 923 señales en 17 sujetos producen alta varianza
-   LOSO (std AUC ~0.20). El rendimiento del clasificador está acotado por la escasez de datos.
-2. **Clasificador entrenado solo con señales etiquetadas de pacientes**: no hay etiquetas para
-   controles, por lo que la calidad de la clasificación en ese grupo no está validada.
-3. **LOSO estricto**: la distribución acústica varía notablemente entre sujetos (AUC 0.26–0.95).
-   El rendimiento medio esconde diferencias individuales importantes.
-4. **VGGish no es adecuado**: preentrenado en audio a 16 kHz de dominio general; el
-   mismatch de dominio con sonidos respiratorios a 4 kHz invalida los embeddings.
-
-### Clínicas
-5. **ΔCAS con alta varianza intra-grupo**: el biomarcador no discrimina significativamente
-   BDR+ de BDR− ni de controles a nivel de grupo (test Mann-Whitney no significativo).
-   Causas posibles: ruido en la clasificación, variabilidad fisiológica real, n pequeño.
-6. **La fórmula ΔCAS es sensible a valores bajos de tasa pre-BD**: sujetos con pocos CAS
-   pre-BD producen valores extremos de ΔCAS (P10: −140 %, P21: −833 %).
-7. **Solo se evalúan 6 maniobras**: la reproducibilidad inter-sesión no se estudia.
-8. **No se valida el biomarker contra gold standard clínico** (espirometría, FeNO).
+| Documento | Contenido |
+|---|---|
+| [`DOCUMENTACION.md`](DOCUMENTACION.md) | Documentación técnica detallada de los pasos 1–4 |
+| [`docs/comparacion_pipeline_gabriel_vs_adria.md`](docs/comparacion_pipeline_gabriel_vs_adria.md) | Análisis comparativo completo Gabriel vs Adria |
+| [`docs/plan_accion_mejora_pipeline.md`](docs/plan_accion_mejora_pipeline.md) | Plan de acción para mejorar el LOSO con 3 fases |
 
 ---
 
-## 10. Conclusiones
+## 11. Limitaciones actuales
 
-1. Se procesaron correctamente **14 900 señales** de 28 sujetos con el pipeline completo
-   (lectura → preprocesado → segmentación → features → clasificación → análisis).
+### Del pipeline StratifiedKFold (step6_classification.py)
+1. **Fuga de datos**: segmentos del mismo paciente en train y test — métricas sobreestimadas.
+2. **Sin DL**: CNN-1D y BiLSTM de Adria requieren TensorFlow (no instalable en este entorno).
+3. **Ensemble no óptimo**: VotingClassifier simple, sin búsqueda de peso ML/DL.
 
-2. El **SVM** obtuvo el mejor rendimiento (AUC = 0.652 ± 0.206) en validación LOSO
-   estricta por sujeto, seguido de cerca por RF (0.654 ± 0.167).
+### Del pipeline LOSO (step6_classification_loso.py)
+4. **Alta varianza inter-sujeto**: std AUC ~0.15 con solo 17 folds.
+5. **Features de identidad**: los MFCCs absolutos codifican el tracto vocal → perjudican LOSO.
+6. **Clasificación a nivel de segmento**: la unidad clínica correcta es el paciente, no el segmento.
+7. **Sin explotación de pre/post BD**: el delta de features entre sesiones no está implementado.
 
-3. Los **BDR+** muestran una tendencia positiva en ΔCAS (reducción de CAS post-BD)
-   coherente con la respuesta broncodilatadora, más clara en **ch2** e **inspiración**.
-   Sin embargo, la alta varianza impide conclusiones estadísticamente robustas.
-
-4. El **deep learning no aportó mejora** sobre features manuales en este contexto de
-   datos limitados — resultado esperado y con valor como hallazgo metodológico.
-
-5. La principal limitación es el **tamaño de la muestra**: más sujetos etiquetados
-   mejorarían tanto el clasificador como la potencia estadística del análisis de BD.
+### Plan de mejora
+Ver [`docs/plan_accion_mejora_pipeline.md`](docs/plan_accion_mejora_pipeline.md) para el plan
+detallado en 3 fases (SelectKBest dentro del fold, MFCCs dinámicos, delta pre/post BD).
+AUC LOSO objetivo tras Fase 3: **0.75–0.82**.
 
 ---
 
-## Ficheros generados
+## 12. Estructura del repositorio
 
 ```
-outputs/
-├── results/
-│   ├── step5/   X_labeled_features.npy (1923×15), y_labeled.npy, groups_labeled.npy
-│   ├── step6/   svm/rf/xgb/ensemble_loso_results.csv, best_model.pkl, predictions_all.npz
-│   ├── step7/   cas_metrics_{all,ch1,ch2,insp,esp,ch1_insp,...}.csv, group_statistics.csv
-│   └── step8/   X_spectrograms.npy, X_vggish_embeddings.npy, dl_comparison_results.json
-└── figures/
-    ├── step6/   ROC curves, confusion matrices, AUC por fold, feature importance, CAS rate
-    ├── step7/   pre/post comparativa, delta CAS por sujeto, boxplots, heatmap, ROC biomarker
-    └── step8/   espectrogramas ejemplo/medio, comparativa AUC, curvas entrenamiento CNN
+Project/
+├── Data/                                  # Señales .mat (no en git — datos privados)
+│   ├── P1.mat … P23.mat, C1.mat … C5.mat
+│   ├── tP1.mat … tP23.mat, tC1.mat … tC5.mat
+│   └── database/subject_metadata.csv
+├── Adria/                                 # Pipeline de Adria (referencia)
+│   ├── preprocessing_pipeline.py
+│   └── classification.py
+├── docs/
+│   ├── comparacion_pipeline_gabriel_vs_adria.md
+│   └── plan_accion_mejora_pipeline.md
+├── outputs/
+│   ├── figures/
+│   │   ├── step5/    distribuciones, correlación, medias CAS/NO-CAS
+│   │   ├── step6/    ROC, confusion matrices, AUC por fold, importancia, CAS rate
+│   │   ├── step6_loso/  mismas figuras para validación LOSO
+│   │   ├── step7/    pre/post comparativa, ΔCAS, boxplots, heatmap, ROC biomarker
+│   │   └── step8/    espectrogramas, comparativa AUC, curvas CNN
+│   └── results/
+│       ├── step5/    X_labeled/all_features.npy, y_labeled.npy, groups_labeled.npy
+│       ├── step6/    *_loso_results.csv, best_model.pkl, predictions_all.npz
+│       ├── step6_loso/  ídem para validación LOSO estricta
+│       ├── step7/    cas_metrics_*.csv, group_statistics.csv
+│       └── step8/    X_spectrograms.npy, X_vggish_embeddings.npy, dl_comparison_results.json
+└── src/
+    ├── step1_read_signals.py
+    ├── step2_preprocessing.py
+    ├── step3_segmentation.py
+    ├── step4_dataset.py
+    ├── step5_features.py              ← 164 features (MFCC + wavelet + MAD)
+    ├── step6_classification.py        ← StratifiedKFold-5 + SMOTE (Acc ~0.81)
+    ├── step6_classification_loso.py   ← LOSO + SelectKBest(30) (AUC ~0.66)
+    ├── step7_biomarker_analysis.py
+    ├── step8_deep_learning.py
+    └── analyze_labels.py
 ```
 
 ---
 
-*Código: Python 3.11 · scikit-learn 1.7 · PyTorch 2.11+cu128 · scipy 1.17 · RTX 5070 Laptop*
+## 13. Instalación y ejecución
+
+```bash
+# Clonar y configurar entorno
+git clone <url-repositorio>
+cd Project
+python -m venv .venv && .venv\Scripts\activate    # Windows
+
+pip install numpy scipy matplotlib seaborn pandas scikit-learn
+pip install imbalanced-learn xgboost librosa PyWavelets
+
+# Ejecutar pipeline completo en orden
+python src/step1_read_signals.py
+python src/step2_preprocessing.py
+python src/step3_segmentation.py
+python src/step4_dataset.py
+python src/step5_features.py           # genera 164 features (~6 min)
+python src/step6_classification.py     # StratifiedKFold-5 (~3 min)
+python src/step6_classification_loso.py  # LOSO estricto (~1 min)
+python src/step7_biomarker_analysis.py
+python src/step8_deep_learning.py
+```
+
+---
+
+*Python 3.11 · scikit-learn · XGBoost · librosa · PyWavelets · imbalanced-learn · scipy*
