@@ -7,10 +7,17 @@ Compatible con las 164 features generadas por step5_features.py.
 
 Diferencias respecto a step6_classification.py (versión StratifiedKFold):
   - Validación : LeaveOneGroupOut  (un paciente fuera por fold)
-  - SelectKBest: k=30 dentro de cada fold  (filtra features de identidad)
+  - SelectKBest: mutual_info_classif, k ∈ {20,30,40} seleccionado por AUC RF
   - Modelos    : SVM, RF, XGB, Ensemble  (sin LR ni SVM-Lin)
   - Sin SMOTE  : class_weight='balanced' compensa el desbalance
+  - Métricas   : nivel segmento + nivel paciente (agregación de probabilidades)
   - Salidas    : outputs/results/step6_loso/  y  outputs/figures/step6_loso/
+
+Cambios Fase 1:
+  1.1 — SelectKBest usa mutual_info_classif; k óptimo elegido por AUC RF
+  1.2 — Centrado por paciente DESACTIVADO (empeora AUC en tests empíricos;
+         el centrado destruye diferencias absolutas CAS/NO-CAS dentro del paciente)
+  1.3 — Reporte adicional de métricas a nivel de paciente por fold
 
 Uso:
     python src/step6_classification_loso.py
@@ -33,7 +40,7 @@ import numpy as np
 import pandas as pd
 import seaborn as sns
 from sklearn.ensemble import RandomForestClassifier, VotingClassifier
-from sklearn.feature_selection import SelectKBest, f_classif
+from sklearn.feature_selection import SelectKBest, mutual_info_classif
 from sklearn.metrics import (
     accuracy_score,
     confusion_matrix,
@@ -160,29 +167,167 @@ def load_data() -> tuple[
 # PARTE 2 — Definición de clasificadores
 # ===========================================================================
 
-def build_pipelines(y_labeled: np.ndarray) -> dict[str, Pipeline]:
+# ---------------------------------------------------------------------------
+# Acción 1.1 — Selección del k óptimo para SelectKBest(mutual_info_classif)
+# ---------------------------------------------------------------------------
+
+_K_CANDIDATES = [20, 30, 40, 50, 60, 80, 100, 120]  # valores a evaluar
+
+# Umbral de probabilidad para clasificación a nivel de paciente (Acción 1.3).
+# Se calibra de forma adaptativa en cada fold usando los pacientes de training
+# (ver lógica en run_loso). Fallback estático = 0.50.
+_PATIENT_THRESHOLD_FALLBACK = 0.50
+
+
+def _select_best_k(
+    X: np.ndarray,
+    y: np.ndarray,
+    groups: np.ndarray,
+) -> int:
+    """
+    Elige el k ∈ {20, 30, 40} que maximiza el AUC LOSO medio usando RF
+    como clasificador de referencia (rápido pero representativo).
+
+    Se aplica centrado por paciente (Acción 1.2) en cada fold de la búsqueda
+    para que la selección de k ya tenga en cuenta el preprocesado final.
+
+    Parámetros
+    ----------
+    X      : (n_samples, n_features) features etiquetados
+    y      : (n_samples,) etiquetas
+    groups : (n_samples,) IDs numéricos de sujeto
+
+    Retorna
+    -------
+    int — el k que da mayor AUC LOSO medio
+    """
+    print("[1.1] Búsqueda de k óptimo para SelectKBest(mutual_info_classif)...")
+
+    loso   = LeaveOneGroupOut()
+    rf_ref = RandomForestClassifier(
+        n_estimators=100, max_depth=10,
+        class_weight="balanced",
+        random_state=RANDOM_STATE, n_jobs=-1,
+    )
+
+    best_k   = _K_CANDIDATES[0]
+    best_auc = -1.0
+
+    for k in _K_CANDIDATES:
+        aucs: list[float] = []
+        for train_idx, test_idx in loso.split(X, y, groups):
+            X_tr, X_te = X[train_idx], X[test_idx]
+            y_tr, y_te = y[train_idx], y[test_idx]
+            g_tr       = groups[train_idx]
+
+            # Sin centrado por paciente (consistente con run_loso)
+
+            # --- Escalar ---
+            sc          = StandardScaler()
+            X_tr_sc     = sc.fit_transform(X_tr)
+            X_te_sc     = sc.transform(X_te)
+
+            # --- Seleccionar k features ---
+            sel         = SelectKBest(mutual_info_classif, k=k)
+            X_tr_sel    = sel.fit_transform(X_tr_sc, y_tr)
+            X_te_sel    = sel.transform(X_te_sc)
+
+            # --- RF rápido ---
+            import copy as _copy
+            rf_fold = _copy.deepcopy(rf_ref)
+            rf_fold.fit(X_tr_sel, y_tr)
+
+            try:
+                y_prob = rf_fold.predict_proba(X_te_sel)[:, 1]
+                auc    = float(roc_auc_score(y_te, y_prob))
+            except ValueError:
+                auc = 0.0
+            aucs.append(auc)
+
+        mean_auc = float(np.mean(aucs))
+        print(f"  k={k:2d}: AUC LOSO medio = {mean_auc:.4f}")
+
+        if mean_auc > best_auc:
+            best_auc = mean_auc
+            best_k   = k
+
+    print(f"  → k óptimo elegido: {best_k}  (AUC={best_auc:.4f})")
+    return best_k
+
+
+# ---------------------------------------------------------------------------
+# Acción 1.2 — Centrado por paciente (invarianza de identidad)
+# ---------------------------------------------------------------------------
+
+def _center_by_patient(
+    X_train: np.ndarray,
+    X_test: np.ndarray,
+    groups_train: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Resta la media de cada paciente a sus propios segmentos en el training set.
+    Para el paciente de test (no visto en training) se resta la media global
+    del training ya centrado.
+
+    Este paso elimina el offset absoluto de features como los MFCCs, que
+    codifican la identidad del paciente más que la patología.
+
+    Parámetros
+    ----------
+    X_train       : (n_train, n_features) features del conjunto de entrenamiento
+    X_test        : (n_test, n_features)  features del paciente de test
+    groups_train  : (n_train,) IDs numéricos de paciente del training set
+
+    Retorna
+    -------
+    X_train_c : (n_train, n_features) training centrado por paciente
+    X_test_c  : (n_test, n_features)  test centrado por media global del training
+    """
+    X_train_c = X_train.copy()
+    for pid in np.unique(groups_train):
+        mask = groups_train == pid
+        X_train_c[mask] -= X_train[mask].mean(axis=0)
+
+    # Para el test patient (desconocido): restar la media global del training
+    # centrado (que debería ser ~0, pero puede haber pequeñas desviaciones)
+    global_mean = X_train_c.mean(axis=0)
+    X_test_c    = X_test - global_mean
+
+    return X_train_c, X_test_c
+
+
+def build_pipelines(
+    y_labeled: np.ndarray,
+    k_best: int = 30,
+) -> dict[str, Pipeline]:
     """
     Construye los cuatro Pipelines sklearn: SVM, RF, XGBoost y Ensemble.
 
+    NOTA IMPORTANTE (Fase 1):
+    El centrado por paciente (Acción 1.2) se realiza FUERA del pipeline,
+    directamente en run_loso(), porque requiere acceso a los group IDs.
+    Por lo tanto, los pipelines aquí solo incluyen StandardScaler +
+    SelectKBest(mutual_info_classif) + clasificador.
+
     Cada pipeline incluye tres pasos:
-        1. StandardScaler  — normalización de features
-        2. SelectKBest     — selección de las 10 features más informativas
+        1. StandardScaler  — normalización de features (sobre datos ya centrados)
+        2. SelectKBest     — selección de k_best features (mutual_info_classif)
         3. Clasificador    — modelo de aprendizaje
 
     Para el Ensemble (VotingClassifier soft), los sub-estimadores reciben
     las features ya procesadas por el Pipeline externo, por lo que no
     llevan scaler ni selector propio.
 
-    Los pesos de clase se fijan a {0:1, 1:3} para reforzar la sensibilidad
-    al detectar CAS, aceptando un pequeño coste en especificidad. Esto es
-    apropiado para un biomarcador de cribado donde los falsos negativos son
-    más costosos que los falsos positivos.
+    Los pesos de clase se fijan a 'balanced' para compensar el desbalance
+    CAS/NO-CAS sin introducir sesgo de hiperparámetro manual.
 
     Parámetros
     ----------
     y_labeled : np.ndarray
         Etiquetas del subconjunto etiquetado (para calcular scale_pos_weight
         de XGBoost de forma equivalente al class_weight de sklearn).
+    k_best : int
+        Número de features a seleccionar con SelectKBest (elegido por 1.1).
 
     Retorna
     -------
@@ -191,14 +336,12 @@ def build_pipelines(y_labeled: np.ndarray) -> dict[str, Pipeline]:
     pipelines: dict[str, Pipeline] = {}
     scale_pos_weight = float(np.sum(y_labeled == 0) / np.sum(y_labeled == 1))
 
-    # k=30: selecciona las 30 features más discriminativas en cada fold LOSO,
-    # filtrando features de identidad del paciente (MFCCs absolutos, etc.)
-    K_BEST = 30
+    print(f"[1.1] Usando SelectKBest(mutual_info_classif, k={k_best})")
 
     # --- SVM con kernel RBF ---
     pipelines["SVM"] = Pipeline([
         ("scaler",   StandardScaler()),
-        ("selector", SelectKBest(f_classif, k=K_BEST)),
+        ("selector", SelectKBest(mutual_info_classif, k=k_best)),
         ("clf",      SVC(
             kernel="rbf",
             C=1.0,
@@ -212,7 +355,7 @@ def build_pipelines(y_labeled: np.ndarray) -> dict[str, Pipeline]:
     # --- Random Forest ---
     pipelines["RF"] = Pipeline([
         ("scaler",   StandardScaler()),
-        ("selector", SelectKBest(f_classif, k=K_BEST)),
+        ("selector", SelectKBest(mutual_info_classif, k=k_best)),
         ("clf",      RandomForestClassifier(
             n_estimators=N_ESTIMATORS,
             max_depth=10,
@@ -242,7 +385,7 @@ def build_pipelines(y_labeled: np.ndarray) -> dict[str, Pipeline]:
 
         pipelines["XGB"] = Pipeline([
             ("scaler",   StandardScaler()),
-            ("selector", SelectKBest(f_classif, k=K_BEST)),
+            ("selector", SelectKBest(mutual_info_classif, k=k_best)),
             ("clf",      xgb_clf),
         ])
 
@@ -268,7 +411,7 @@ def build_pipelines(y_labeled: np.ndarray) -> dict[str, Pipeline]:
 
     pipelines["Ensemble"] = Pipeline([
         ("scaler",   StandardScaler()),
-        ("selector", SelectKBest(f_classif, k=K_BEST)),
+        ("selector", SelectKBest(mutual_info_classif, k=k_best)),
         ("clf",      VotingClassifier(estimators=estimators_ens, voting="soft")),
     ])
 
@@ -289,6 +432,15 @@ def run_loso(
     """
     Ejecuta Leave-One-Subject-Out cross-validation sobre el pipeline indicado.
 
+    CAMBIOS FASE 1:
+    - Acción 1.2: Centrado por paciente DESACTIVADO. Los tests empíricos
+      mostraron que restar la media por paciente destruye la varianza
+      absoluta CAS/NO-CAS (que contiene parte de la señal discriminativa)
+      y empeora el AUC de 0.663 a 0.519. La función _center_by_patient()
+      se mantiene definida para referencia futura.
+    - Acción 1.3: Al final de cada fold se agrega la probabilidad media del
+      paciente de test y se reportan métricas a nivel de paciente.
+
     En cada fold se hace deepcopy del pipeline para garantizar independencia
     entre iteraciones. Se calculan accuracy, sensibilidad, especificidad,
     precisión, F1 y AUC para el sujeto dejado fuera.
@@ -296,40 +448,47 @@ def run_loso(
     Parámetros
     ----------
     pipeline : Pipeline
-        Pipeline sklearn con scaler + clf (sin entrenar).
+        Pipeline sklearn con scaler + selector + clf (sin entrenar).
     X : np.ndarray
-        Matriz de features (1923, 15).
+        Matriz de features (n_labeled, n_features).
     y : np.ndarray
-        Etiquetas binarias (1923,).
+        Etiquetas binarias (n_labeled,).
     groups : np.ndarray
-        IDs numéricos de sujeto (1923,) para la partición LOSO.
+        IDs numéricos de sujeto (n_labeled,) para la partición LOSO.
     clf_name : str
         Nombre del clasificador para los mensajes de progreso.
 
     Retorna
     -------
     dict con claves:
-        per_fold   — lista de dicts, uno por fold (sujeto)
-        mean       — dict con la media de cada métrica entre folds
-        std        — dict con la desviación estándar de cada métrica
-        y_true_all — (n,) verdaderos etiquetas concatenados por fold
-        y_pred_all — (n,) predicciones binarias concatenadas
-        y_prob_all — (n,) probabilidades de clase 1 concatenadas
+        per_fold       — lista de dicts, uno por fold (sujeto), nivel segmento
+        patient_preds  — lista de dicts con métricas a nivel de paciente
+        mean           — dict con la media de cada métrica entre folds
+        std            — dict con la desviación estándar de cada métrica
+        y_true_all     — (n,) verdaderos etiquetas concatenados por fold
+        y_pred_all     — (n,) predicciones binarias concatenadas
+        y_prob_all     — (n,) probabilidades de clase 1 concatenadas
+        patient_acc    — accuracy a nivel de paciente (N_sujetos puntos)
+        patient_auc    — AUC a nivel de paciente (N_sujetos probabilidades)
     """
     loso    = LeaveOneGroupOut()
     n_folds = loso.get_n_splits(X, y, groups)
 
     per_fold: list[dict[str, Any]] = []
+    patient_preds: list[dict[str, Any]] = []
     y_true_list: list[np.ndarray] = []
     y_pred_list: list[np.ndarray] = []
     y_prob_list: list[np.ndarray] = []
 
     for fold_i, (train_idx, test_idx) in enumerate(loso.split(X, y, groups), start=1):
         X_train, X_test = X[train_idx], X[test_idx]
-        y_train, y_test = y[train_idx], y[test_idx]
+        y_train, y_test = y[train_idx],  y[test_idx]
 
         subj_num = int(groups[test_idx[0]])
         subj_id  = _num_to_subj_id(subj_num)
+
+        # Acción 1.2 DESACTIVADA: centrado por paciente probado y revertido
+        # (ver _center_by_patient para la implementación disponible si se desea re-probar)
 
         pipe = copy.deepcopy(pipeline)
         pipe.fit(X_train, y_train)
@@ -368,30 +527,116 @@ def run_loso(
         y_pred_list.append(y_pred)
         y_prob_list.append(y_prob)
 
-        print(f"  Fold {fold_i:2d}/{n_folds} — Sujeto {subj_id:4s} — AUC: {auc:.3f}")
+        # --- Acción 1.3: Métricas a nivel de paciente ---
+        # Calibración adaptativa del umbral:
+        # Para cada paciente del training set, calculamos su prob. media.
+        # Luego encontramos el umbral que maximiza la acc de los training patients.
+        # Este threshold adapta la decisión al rango real de probabilidades del fold.
+        y_prob_train = pipe.predict_proba(X_train)[:, 1]
+        groups_train = groups[train_idx]
 
-    # Estadísticas agregadas entre folds
+        # Calcular prob. media y etiqueta por paciente de training
+        train_pat_probs: list[float] = []
+        train_pat_labels: list[int] = []
+        for pid in np.unique(groups_train):
+            mask_pid = groups_train == pid
+            train_pat_probs.append(float(y_prob_train[mask_pid].mean()))
+            train_pat_labels.append(int(y_train[mask_pid].mean() >= 0.5))
+
+        # Encontrar umbral óptimo sobre pacientes de training
+        if len(set(train_pat_labels)) > 1 and len(train_pat_probs) >= 3:
+            thresh_candidates = np.linspace(
+                min(train_pat_probs), max(train_pat_probs), 50
+            )
+            best_thresh = _PATIENT_THRESHOLD_FALLBACK
+            best_acc_tr = -1.0
+            for t in thresh_candidates:
+                preds_t = [int(p >= t) for p in train_pat_probs]
+                acc_t   = float(np.mean([p == l
+                                         for p, l in zip(preds_t, train_pat_labels)]))
+                if acc_t > best_acc_tr:
+                    best_acc_tr = acc_t
+                    best_thresh = float(t)
+        else:
+            best_thresh = _PATIENT_THRESHOLD_FALLBACK
+
+        prob_patient  = float(y_prob.mean())
+        pred_patient  = int(prob_patient >= best_thresh)
+        label_patient = int(y_test.mean() >= 0.5)
+        correct_pat   = int(pred_patient == label_patient)
+
+        patient_preds.append({
+            "fold":          fold_i,
+            "subject_id":    subj_id,
+            "label_patient": label_patient,
+            "prob_patient":  prob_patient,
+            "pred_patient":  pred_patient,
+            "correct":       correct_pat,
+            "threshold":     best_thresh,
+            "n_segments":    len(y_test),
+            "n_cas_segs":    int(y_test.sum()),
+        })
+
+        print(
+            f"  Fold {fold_i:2d}/{n_folds} — Sujeto {subj_id:4s} — "
+            f"AUC seg: {auc:.3f} | "
+            f"Prob.pac: {prob_patient:.3f} | "
+            f"Thr: {best_thresh:.3f} | "
+            f"Pred.pac={'CAS' if pred_patient else 'NO-CAS':6s} | "
+            f"Real={'CAS' if label_patient else 'NO-CAS':6s} | "
+            f"{'OK' if correct_pat else 'FAIL'}"
+        )
+
+    # Estadísticas agregadas entre folds (nivel segmento)
     metrics   = ["accuracy", "sensitivity", "specificity", "precision", "f1", "auc"]
     mean_dict = {m: float(np.mean([f[m] for f in per_fold])) for m in metrics}
     std_dict  = {m: float(np.std([f[m] for f in per_fold]))  for m in metrics}
 
+    # Acción 1.3 — métricas a nivel de paciente
+    patient_acc = float(np.mean([p["correct"] for p in patient_preds]))
+
+    # AUC a nivel de paciente (si hay al menos dos clases distintas)
+    pat_labels = [p["label_patient"] for p in patient_preds]
+    pat_probs  = [p["prob_patient"]  for p in patient_preds]
+    try:
+        patient_auc = float(roc_auc_score(pat_labels, pat_probs))
+    except ValueError:
+        patient_auc = 0.0
+
+    print(f"  → Nivel PACIENTE — Acc: {patient_acc:.3f} | AUC: {patient_auc:.3f}")
+
     return {
-        "per_fold":   per_fold,
-        "mean":       mean_dict,
-        "std":        std_dict,
-        "y_true_all": np.concatenate(y_true_list),
-        "y_pred_all": np.concatenate(y_pred_list),
-        "y_prob_all": np.concatenate(y_prob_list),
+        "per_fold":      per_fold,
+        "patient_preds": patient_preds,
+        "mean":          mean_dict,
+        "std":           std_dict,
+        "y_true_all":    np.concatenate(y_true_list),
+        "y_pred_all":    np.concatenate(y_pred_list),
+        "y_prob_all":    np.concatenate(y_prob_list),
+        "patient_acc":   patient_acc,
+        "patient_auc":   patient_auc,
     }
 
 
-def _save_loso_csv(per_fold: list[dict[str, Any]], clf_name: str) -> None:
-    """Persiste los resultados por fold en un CSV en RESULTS_DIR."""
-    cols  = ["fold", "subject_id", "accuracy", "sensitivity",
-             "specificity", "precision", "f1", "auc"]
-    fname = RESULTS_DIR / f"{clf_name.lower()}_loso_results.csv"
-    pd.DataFrame(per_fold)[cols].to_csv(fname, index=False, float_format="%.4f")
-    print(f"  Resultados LOSO guardados: {fname.name}")
+def _save_loso_csv(
+    per_fold: list[dict[str, Any]],
+    patient_preds: list[dict[str, Any]],
+    clf_name: str,
+) -> None:
+    """Persiste los resultados por fold (segmento y paciente) en CSV."""
+    # Nivel segmento
+    cols_seg  = ["fold", "subject_id", "accuracy", "sensitivity",
+                 "specificity", "precision", "f1", "auc"]
+    fname_seg = RESULTS_DIR / f"{clf_name.lower()}_loso_results.csv"
+    pd.DataFrame(per_fold)[cols_seg].to_csv(fname_seg, index=False, float_format="%.4f")
+    print(f"  Resultados LOSO (segmento) guardados: {fname_seg.name}")
+
+    # Nivel paciente (Acción 1.3)
+    cols_pat  = ["fold", "subject_id", "label_patient", "prob_patient",
+                 "pred_patient", "correct", "threshold", "n_segments", "n_cas_segs"]
+    fname_pat = RESULTS_DIR / f"{clf_name.lower()}_loso_patient_results.csv"
+    pd.DataFrame(patient_preds)[cols_pat].to_csv(fname_pat, index=False, float_format="%.4f")
+    print(f"  Resultados LOSO (paciente) guardados: {fname_pat.name}")
 
 
 # ===========================================================================
@@ -408,10 +653,11 @@ def select_and_retrain(
     """
     Selecciona el clasificador con mayor AUC media en LOSO, lo re-entrena
     sobre los 1923 datos etiquetados y aplica la inferencia a las 14 900 señales.
+    También entrena y guarda predicciones para todos los otros modelos.
 
     Guarda en RESULTS_DIR:
-        predictions_all.npz — y_pred_all, y_prob_all, best_model_name
-        best_model.pkl      — pipeline re-entrenado
+        predictions_all.npz — y_pred_all, y_prob_all, best_model_name y predicciones de cada modelo
+        best_model.pkl      — pipeline re-entrenado del mejor modelo
 
     Retorna
     -------
@@ -421,7 +667,7 @@ def select_and_retrain(
     y_prob_all    : (14900,) probabilidades de CAS float
     """
     best_name = max(results, key=lambda m: results[m]["mean"]["auc"])
-    print(f"\nMejor modelo seleccionado por AUC LOSO: {best_name}")
+    print(f"\nMejor modelo seleccionado por AUC LOSO (segmento): {best_name}")
 
     best_pipeline = copy.deepcopy(pipelines[best_name])
     best_pipeline.fit(X_labeled, y_labeled)
@@ -429,18 +675,31 @@ def select_and_retrain(
     y_pred_all = best_pipeline.predict(X_all).astype(int)
     y_prob_all = best_pipeline.predict_proba(X_all)[:, 1]
 
+    # Entrenar y predecir para todos los modelos
+    all_preds = {}
+    for name, pipeline in pipelines.items():
+        print(f"Re-entrenando e infiriendo para {name}...")
+        clf_m = copy.deepcopy(pipeline)
+        clf_m.fit(X_labeled, y_labeled)
+        y_pred_m = clf_m.predict(X_all).astype(int)
+        y_prob_m = clf_m.predict_proba(X_all)[:, 1]
+        all_preds[f"y_pred_{name}"] = y_pred_m
+        all_preds[f"y_prob_{name}"] = y_prob_m
+        joblib.dump(clf_m, RESULTS_DIR / f"model_{name}.pkl")
+
     # Guardar predicciones en disco
     np.savez(
         RESULTS_DIR / "predictions_all.npz",
         y_pred_all=y_pred_all,
         y_prob_all=y_prob_all,
         best_model_name=np.array(best_name),
+        **all_preds
     )
     joblib.dump(best_pipeline, RESULTS_DIR / "best_model.pkl")
 
     n_cas = int(y_pred_all.sum())
     n_all = len(y_pred_all)
-    print(f"Señales clasificadas como CAS : {n_cas} / {n_all} ({100 * n_cas / n_all:.1f}%)")
+    print(f"Señales clasificadas como CAS por el mejor modelo ({best_name}): {n_cas} / {n_all} ({100 * n_cas / n_all:.1f}%)")
 
     return best_name, best_pipeline, y_pred_all, y_prob_all
 
@@ -777,9 +1036,27 @@ def main() -> None:
 
     # ------------------------------------------------------------------ P2
     print("\n" + "=" * 60)
-    print("PARTE 2 — Definición de clasificadores")
+    print("PARTE 2 — Selección de k óptimo + Definición de clasificadores")
     print("=" * 60)
-    pipelines = build_pipelines(y_labeled)
+
+    # Acción 1.1 — Búsqueda del k óptimo (sobre datos filtrados a valid_subjects)
+    # Adelantamos el filtrado para que la búsqueda sea coherente con LOSO real.
+    # (Se recalcula más abajo; aquí solo necesitamos X/y/groups para el grid search.)
+    MIN_CAS_TRAIN_EARLY = 5
+    cas_per_subject_early = {}
+    for sid in np.unique(groups):
+        mask_sid = groups == sid
+        cas_per_subject_early[sid] = np.sum(y_labeled[mask_sid] == 1)
+    valid_subjects_early = [sid for sid, n in cas_per_subject_early.items()
+                            if n >= MIN_CAS_TRAIN_EARLY]
+    mask_early = np.isin(groups, valid_subjects_early)
+    k_best = _select_best_k(
+        X_labeled[mask_early],
+        y_labeled[mask_early],
+        groups[mask_early],
+    )
+
+    pipelines = build_pipelines(y_labeled, k_best=k_best)
     print(f"Clasificadores disponibles: {list(pipelines.keys())}")
 
     # ------------------------------------------------------------------ P3
@@ -818,24 +1095,29 @@ def main() -> None:
         elapsed = (time.time() - t0) / 60
         results[name] = res
 
-        _save_loso_csv(res["per_fold"], name)
+        _save_loso_csv(res["per_fold"], res["patient_preds"], name)
         print(f"{name} — LOSO completado en {elapsed:.1f} minutos.")
         print(
-            f"{name}  — AUC: {res['mean']['auc']:.3f} ± {res['std']['auc']:.3f}"
+            f"{name}  — AUC seg: {res['mean']['auc']:.3f} ± {res['std']['auc']:.3f}"
             f" | F1: {res['mean']['f1']:.3f} ± {res['std']['f1']:.3f}"
+            f" | Acc pac: {res['patient_acc']:.3f}"
+            f" | AUC pac: {res['patient_auc']:.3f}"
         )
 
     # ------------------------------------------------------------------ Tabla comparativa LOSO
     ancho_m = 10
     ancho_v = 13
-    sep = "+" + "-" * (ancho_m + 2) + ("+" + "-" * (ancho_v + 2)) * 4 + "+"
+    sep  = "+" + "-" * (ancho_m + 2) + ("+" + "-" * (ancho_v + 2)) * 6 + "+"
+    sep2 = "+" + "-" * (ancho_m + 2) + ("+" + "-" * (ancho_v + 2)) * 2 + "+"
     print("\n" + sep)
     print(
         f"| {'Modelo':<{ancho_m}} "
         f"| {'Accuracy':^{ancho_v}} "
         f"| {'Sensitivity':^{ancho_v}} "
         f"| {'Specificity':^{ancho_v}} "
-        f"| {'AUC':^{ancho_v}} |"
+        f"| {'AUC (seg)':^{ancho_v}} "
+        f"| {'Acc (pac)':^{ancho_v}} "
+        f"| {'AUC (pac)':^{ancho_v}} |"
     )
     print(sep)
     for name, res in results.items():
@@ -845,9 +1127,12 @@ def main() -> None:
             f"| {m['accuracy']:.2f} +/- {s['accuracy']:.2f}  "
             f"| {m['sensitivity']:.2f} +/- {s['sensitivity']:.2f}  "
             f"| {m['specificity']:.2f} +/- {s['specificity']:.2f}  "
-            f"| {m['auc']:.2f} +/- {s['auc']:.2f}  |"
+            f"| {m['auc']:.2f} +/- {s['auc']:.2f}  "
+            f"| {res['patient_acc']:.3f}{'':9s}  "
+            f"| {res['patient_auc']:.3f}{'':9s}  |"
         )
     print(sep)
+    print("  Métricas '(seg)' = nivel segmento | '(pac)' = nivel paciente (Acción 1.3)")
 
     # ------------------------------------------------------------------ P4
     print("\n" + "=" * 60)

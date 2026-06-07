@@ -21,6 +21,8 @@ Sortides (carpeta ./preprocessed/):
 """
 
 import os, sys, time, pickle
+sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+sys.stderr.reconfigure(encoding='utf-8', errors='replace')
 import numpy as np
 import scipy.io
 from scipy.signal import (resample_poly, butter, filtfilt,
@@ -705,8 +707,8 @@ def save_dataset(all_signals, metadata_df, out_dir):
 # =============================================================================
 
 if __name__ == '__main__':
-    DATA_DIR = os.path.dirname(os.path.abspath(__file__))
-    OUT_DIR  = os.path.join(DATA_DIR, 'preprocessed')
+    DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'Data')
+    OUT_DIR  = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'preprocessed')
     os.makedirs(OUT_DIR, exist_ok=True)
 
     print('=' * 60)

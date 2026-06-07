@@ -1,16 +1,24 @@
 """
 Extracción de features de los segmentos respiratorios.
 
-Procesa las 14 900 señales construidas en el paso 4, extrae 164 features
+Procesa las 14 900 señales construidas en el paso 4, extrae features
 por segmento y guarda las matrices resultantes en disco para su uso en
 step6_classification.py. Si el caché existe, lo carga directamente sin
 recomputar.
 
-Grupos de features (164 total):
-  - Temporales      : 16  (RMS, std, varianza, energía, skewness, kurtosis…)
-  - Espectrales     : 13  (centroide, spread, rolloff, flatness, entropía + 5 bandas)
-  - MFCC            : 120 (20 MFCCs × media + std × 3 órdenes: main/delta/delta²)
-  - Wavelet (db4)   : 15  (5 niveles × energía + entropía + std)
+Grupos de features (137 total — Fase 2.1):
+  - Temporales        : 16  (RMS, std, varianza, energía, skewness, kurtosis…)
+  - Espectrales       : 13  (centroide, spread, rolloff, flatness, entropía + 5 bandas)
+  - MFCC dinámico    : 80  (20 coefs × std_temporal + |delta|_mean + delta_std + |delta²|_mean)
+  - Ratios espectrales: 9   (proporciones de banda + ratios alta/baja, invariantes a ganancia)
+  - Modulación AM    : 4   (índice de modulación, frec. dominante, energía lenta/media)
+  - Wavelet (db4)    : 15  (5 niveles × energía + entropía + std)
+
+Cambio respecto a versión anterior:
+  - MFCCs absolutos (120 features, media+std de main/delta/delta²) eliminados.
+    Codificaban identidad del paciente (timbre), no patología.
+  - Sustituidos por MFCCs dinámicos (80): sólo variación temporal intra-paciente.
+  - Añadidos ratios espectrales (9) y modulación AM (4) del plan Fase 2.
 
 Uso:
     python src/step5_features.py
@@ -31,6 +39,7 @@ import numpy as np
 import pandas as pd
 import scipy.io
 import scipy.signal
+from scipy.signal import hilbert
 import scipy.stats
 import seaborn as sns
 import librosa
@@ -72,10 +81,19 @@ def _find_project_root() -> Path:
 _PROJECT_ROOT = _find_project_root()
 
 FS_TARGET    = 4000
-N_FEATURES   = 164
 N_MFCC       = 20
 LABEL_CAS    = 2
 LABEL_NO_CAS = 3
+
+# --- Nuevos hiperparámetros de preprocesamiento ---
+APPLY_BANDPASS_SEGMENT = False  # Si aplicar filtro bandpass al segmento
+APPLY_PREEMPHASIS     = False   # Si aplicar pre-énfasis para potenciar frecuencias altas (sibilancias)
+PREEMPHASIS_ALPHA      = 0.97
+
+# Fase 2.1: MFCCs dinámicos (std + |delta| + delta_std + |delta²|) × 20 coef = 80
+# Ratios espectrales: 9 | Modulación AM: 4
+# Total: 16 + 13 + 80 + 9 + 4 + 15 = 137
+N_FEATURES   = 137
 
 LABELS_FILE  = _PROJECT_ROOT / "proy_labels.mat"
 METADATA_CSV = str(_PROJECT_ROOT / "Data" / "database" / "subject_metadata.csv")
@@ -83,14 +101,26 @@ DATASET_NPZ  = _PROJECT_ROOT / "outputs" / "results" / "step4" / "dataset.npz"
 CACHE_DIR    = _PROJECT_ROOT / "outputs" / "results" / "step5"
 OUTPUT_FIGS = _PROJECT_ROOT / "outputs" / "figures" / "step5"
 
-_MFCC_NAMES: list[str] = (
-    [f"mfcc{i}_mean"   for i in range(N_MFCC)] +
-    [f"mfcc{i}_std"    for i in range(N_MFCC)] +
-    [f"dmfcc{i}_mean"  for i in range(N_MFCC)] +
-    [f"dmfcc{i}_std"   for i in range(N_MFCC)] +
-    [f"d2mfcc{i}_mean" for i in range(N_MFCC)] +
-    [f"d2mfcc{i}_std"  for i in range(N_MFCC)]
-)
+_MFCC_DYN_NAMES: list[str] = (
+    [f"mfcc{i}_std"     for i in range(N_MFCC)] +   # variabilidad temporal (20)
+    [f"dmfcc{i}_absm"   for i in range(N_MFCC)] +   # |delta| medio          (20)
+    [f"dmfcc{i}_std"    for i in range(N_MFCC)] +   # delta std              (20)
+    [f"d2mfcc{i}_absm"  for i in range(N_MFCC)]     # |delta²| medio         (20)
+)   # 80 features
+
+_SPECTRAL_RATIO_NAMES: list[str] = [
+    "sr_prop_70_250", "sr_prop_250_500", "sr_prop_500_1000",
+    "sr_prop_1000_1500", "sr_prop_1500_1900",
+    "sr_hi_lo",      # (500–1900) / (70–500)
+    "sr_mihi_milo",  # (1000–1500) / (250–500)
+    "sr_hihi_mid",   # (1500–1900) / (500–1000)
+    "sr_global",     # (1000–1900) / (70–500)
+]   # 9 features
+
+_AM_NAMES: list[str] = [
+    "am_mod_idx", "am_dom_freq", "am_energy_slow", "am_energy_mid",
+]   # 4 features
+
 _WV_NAMES: list[str] = [
     f"wv_l{lvl}_{stat}"
     for lvl in range(1, 6)
@@ -107,10 +137,17 @@ FEATURE_NAMES: list[str] = (
      "s_dom_freq", "s_centroid2", "s_median_freq",
      "s_bp_70_250", "s_bp_250_500", "s_bp_500_1000",
      "s_bp_1000_1500", "s_bp_1500_1900"] +
-    # --- MFCC (120) ---
-    _MFCC_NAMES +
+    # --- MFCC dinámico (80) ---
+    _MFCC_DYN_NAMES +
+    # --- ratios espectrales (9) ---
+    _SPECTRAL_RATIO_NAMES +
+    # --- modulación AM (4) ---
+    _AM_NAMES +
     # --- wavelet (15) ---
     _WV_NAMES
+)
+assert len(FEATURE_NAMES) == N_FEATURES, (
+    f"FEATURE_NAMES tiene {len(FEATURE_NAMES)} entradas, se esperan {N_FEATURES}"
 )
 # ---------------------------------------------------------------------------
 
@@ -160,6 +197,21 @@ def _build_subject_list_local(
 # ===========================================================================
 # Normalización robusta por segmento (MAD z-score)
 # ===========================================================================
+
+def _pre_emphasis(sig: np.ndarray, alpha: float = 0.97) -> np.ndarray:
+    """Aplica pre-énfasis a la señal: y[n] = x[n] - alpha * x[n-1]."""
+    if len(sig) == 0:
+        return sig
+    return np.append(sig[0], sig[1:] - alpha * sig[:-1])
+
+
+def _bandpass_segment(sig: np.ndarray, fs: int = FS_TARGET, low: float = 70.0, high: float = 1900.0) -> np.ndarray:
+    """Filtro paso-banda Butterworth de fase cero sobre el segmento."""
+    if len(sig) < 15:  # butterworth necesita un tamaño mínimo de señal
+        return sig
+    sos = scipy.signal.butter(4, [low, high], btype="band", fs=fs, output="sos")
+    return scipy.signal.sosfiltfilt(sos, sig)
+
 
 def _mad_normalize(sig: np.ndarray) -> np.ndarray:
     """Normalización robusta: z = (x - mediana) / (1.4826 * MAD)."""
@@ -224,8 +276,21 @@ def _feat_spectral(s: np.ndarray, fs: int = FS_TARGET) -> list[float]:
     return feats   # 13
 
 
-def _feat_mfcc(s: np.ndarray, fs: int = FS_TARGET) -> list[float]:
-    """120 features MFCC: 20 coeficientes × (media+std) × (main+delta+delta²)."""
+def _feat_mfcc_dynamic(s: np.ndarray, fs: int = FS_TARGET) -> list[float]:
+    """
+    80 features MFCC dinámicas: invariantes a la identidad del paciente.
+
+    En lugar de la media de cada MFCC (que codifica el timbre absoluto del
+    tracto vocal — identidad del paciente), se extraen:
+      - std temporal     (20): variabilidad intra-segmento de cada coef.
+      - |delta| medio    (20): magnitud media de la velocidad espectral.
+      - delta std        (20): variabilidad de esa velocidad.
+      - |delta²| medio  (20): magnitud media de la aceleración espectral.
+
+    Estas medidas capturan la DINÁMICA temporal del sonido respiratorio,
+    que difiere entre CAS (modulaciones periódicas) y NO-CAS, sin depender
+    del nivel absoluto del MFCC (que es constante por paciente).
+    """
     s  = _safe(s, 2048).astype(np.float32)
     m  = librosa.feature.mfcc(y=s, sr=fs, n_mfcc=N_MFCC)
     nf = m.shape[1]
@@ -235,10 +300,69 @@ def _feat_mfcc(s: np.ndarray, fs: int = FS_TARGET) -> list[float]:
     d  = librosa.feature.delta(m, width=w, mode=mo)
     d2 = librosa.feature.delta(m, width=w, mode=mo, order=2)
     return (
-        list(np.mean(m, 1).astype(float)) + list(np.std(m, 1).astype(float)) +
-        list(np.mean(d, 1).astype(float)) + list(np.std(d, 1).astype(float)) +
-        list(np.mean(d2, 1).astype(float)) + list(np.std(d2, 1).astype(float))
-    )   # 120
+        list(np.std(m,  axis=1).astype(float))          +   # std temporal  (20)
+        list(np.mean(np.abs(d),  axis=1).astype(float)) +   # |delta| medio (20)
+        list(np.std(d,  axis=1).astype(float))          +   # delta std     (20)
+        list(np.mean(np.abs(d2), axis=1).astype(float))     # |d2| medio    (20)
+    )   # 80
+
+
+def _feat_spectral_ratios(s: np.ndarray, fs: int = FS_TARGET) -> list[float]:
+    """
+    9 features de ratios espectrales invariantes a ganancia.
+
+    Las potencias absolutas de banda dependen del volumen de respiración
+    y la distancia al micrófono (identidad del contexto, no patología).
+    Los ratios entre bandas son invariantes a esa ganancia global.
+
+    CAS (sibilancias, roncus) concentra energía en bandas altas (>500 Hz)
+    mientras que la respiración normal tiene más energía en frecuencias bajas.
+    """
+    s = _safe(s)
+    f, p = scipy.signal.welch(s, fs=fs, nperseg=min(512, len(s)))
+    bp = lambda lo, hi: float(np.sum(p[(f >= lo) & (f < hi)])) + 1e-12
+
+    b1 = bp(70,   250)    # baja
+    b2 = bp(250,  500)    # media-baja
+    b3 = bp(500,  1000)   # media
+    b4 = bp(1000, 1500)   # media-alta
+    b5 = bp(1500, 1900)   # alta
+    total = b1 + b2 + b3 + b4 + b5
+
+    return [
+        b1/total, b2/total, b3/total, b4/total, b5/total,   # proporciones (5)
+        (b3+b4+b5) / (b1+b2),     # ratio global alta/baja
+        b4 / b2,                   # media-alta / media-baja
+        b5 / b3,                   # alta / media
+        (b4+b5) / (b1+b2),         # similar al global, filtro ms agresivo
+    ]   # 9
+
+
+def _feat_amplitude_modulation(s: np.ndarray, fs: int = FS_TARGET) -> list[float]:
+    """
+    4 features de modulación de amplitud (AM) basadas en la envolvente Hilbert.
+
+    CAS como sibilancias tienen modulaciones AM periódicas en la envolvente
+    (rango 5–100 Hz). La respiración normal tiene envolvente más uniforme.
+    Estas features capturan la estructura temporal de la amplitud sin depender
+    del nivel absoluto.
+    """
+    s = _safe(s)
+    envelope = np.abs(hilbert(s))
+    mean_env = float(np.mean(envelope)) + 1e-12
+
+    # Espectro de la envolvente (modulación AM)
+    f_env, p_env = scipy.signal.welch(
+        envelope, fs=fs, nperseg=min(256, len(envelope))
+    )
+    total_env = float(np.sum(p_env)) + 1e-12
+
+    return [
+        float(np.std(envelope)) / mean_env,                           # índice de modulación
+        float(f_env[np.argmax(p_env)]),                                # frec. dominante AM
+        float(np.sum(p_env[f_env <= 20])) / total_env,                # energía AM lenta (<20 Hz)
+        float(np.sum(p_env[(f_env > 20) & (f_env <= 100)])) / total_env,  # AM media (20-100 Hz)
+    ]   # 4
 
 
 def _feat_wavelet(s: np.ndarray) -> list[float]:
@@ -259,20 +383,37 @@ def _feat_wavelet(s: np.ndarray) -> list[float]:
 
 def extract_features(signal: np.ndarray, fs: int = FS_TARGET) -> np.ndarray:
     """
-    Extrae 164 features de un segmento de señal respiratoria.
+    Extrae 137 features de un segmento de señal respiratoria.
 
-    Aplica normalización MAD robusta antes de la extracción para eliminar
-    diferencias de escala entre sujetos. Retorna un array float64 (164,).
+    Grupos:
+      - 16 features temporales
+      - 13 features espectrales (potencias de banda absolutas)
+      - 80 MFCC dinámicos (std + |delta| + delta_std + |delta²|)
+      - 9 ratios espectrales (invariantes a ganancia)
+      - 4 modulación AM (envolvente Hilbert)
+      - 15 wavelet (db4, 5 niveles)
+
+    Aplica preprocesamiento (bandpass y pre-énfasis opcionales) y normalización MAD robusta antes de la extracción.
     NaN e Inf se sustituyen por 0.
     """
-    sig = _mad_normalize(np.asarray(signal, dtype=np.float64))
+    sig = np.asarray(signal, dtype=np.float64)
+
+    if APPLY_BANDPASS_SEGMENT:
+        sig = _bandpass_segment(sig, fs=fs)
+
+    if APPLY_PREEMPHASIS:
+        sig = _pre_emphasis(sig, alpha=PREEMPHASIS_ALPHA)
+
+    sig = _mad_normalize(sig)
 
     feats = (
-        _feat_temporal(sig) +       # 16
-        _feat_spectral(sig, fs) +   # 13
-        _feat_mfcc(sig, fs) +       # 120
-        _feat_wavelet(sig)          # 15
-    )                               # = 164
+        _feat_temporal(sig) +               # 16
+        _feat_spectral(sig, fs) +           # 13
+        _feat_mfcc_dynamic(sig, fs) +       # 80 (dinámicos, Fase 2.1)
+        _feat_spectral_ratios(sig, fs) +    # 9  (invariantes a ganancia, Fase 2.2)
+        _feat_amplitude_modulation(sig, fs) +  # 4 (modulación AM, Fase 2.3)
+        _feat_wavelet(sig)                  # 15
+    )                                       # = 137
 
     arr = np.array(feats, dtype=np.float64)
     return np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
@@ -302,20 +443,27 @@ def build_all_feature_matrices() -> dict:
     cache_file = CACHE_DIR / "X_all_features.npy"
 
     if cache_file.exists():
-        print("Cache encontrado — cargando features desde disco.")
-        X_all     = np.load(CACHE_DIR / "X_all_features.npy")
-        X_labeled = np.load(CACHE_DIR / "X_labeled_features.npy")
-        y_labeled = np.load(CACHE_DIR / "y_labeled.npy")
-        groups    = np.load(CACHE_DIR / "groups_labeled.npy")
-        with open(CACHE_DIR / "feature_names.json", encoding="utf-8") as fh:
-            feat_names = json.load(fh)
-        return {
-            "X_all": X_all,
-            "X_labeled": X_labeled,
-            "y_labeled": y_labeled,
-            "groups": groups,
-            "feature_names": feat_names,
-        }
+        # Verificar que el caché tiene el número correcto de features
+        X_test = np.load(cache_file, mmap_mode="r")
+        n_cached_features = X_test.shape[1]
+        del X_test  # Liberar el mmap antes de posible sobreescritura (Windows errno 22)
+        if n_cached_features == N_FEATURES:
+            print("Cache encontrado — cargando features desde disco.")
+            X_all     = np.load(CACHE_DIR / "X_all_features.npy")
+            X_labeled = np.load(CACHE_DIR / "X_labeled_features.npy")
+            y_labeled = np.load(CACHE_DIR / "y_labeled.npy")
+            groups    = np.load(CACHE_DIR / "groups_labeled.npy")
+            with open(CACHE_DIR / "feature_names.json", encoding="utf-8") as fh:
+                feat_names = json.load(fh)
+            return {
+                "X_all": X_all,
+                "X_labeled": X_labeled,
+                "y_labeled": y_labeled,
+                "groups": groups,
+                "feature_names": feat_names,
+            }
+        else:
+            print(f"Cache obsoleto ({n_cached_features} features vs {N_FEATURES} esperadas) — regenerando.")
 
     # ------------------------------------------------------------------
     # 1. Reconstruir las 14 900 señales mediante el pipeline completo
@@ -369,6 +517,7 @@ def build_all_feature_matrices() -> dict:
     print(f"  X_labeled_features.npy : {X_labeled.shape}")
     print(f"  y_labeled.npy          : {y_labeled.shape}  (CAS={y_labeled.sum()}, NO_CAS={(1-y_labeled).sum()})")
     print(f"  groups_labeled.npy     : {groups.shape}")
+    print(f"  feature_names.json     : {len(FEATURE_NAMES)} features")
 
     return {
         "X_all": X_all,
@@ -470,18 +619,26 @@ def _generate_figures(X_labeled: np.ndarray, y_labeled: np.ndarray) -> None:
     mean_cas_norm  = (X_cas.mean(axis=0)  - feat_min) / feat_range
     mean_ncas_norm = (X_ncas.mean(axis=0) - feat_min) / feat_range
 
-    y_pos = np.arange(N_FEATURES)
+    # Seleccionar las 20 características con mayor diferencia de medias para evitar solapamientos
+    abs_diff = np.abs(mean_cas_norm - mean_ncas_norm)
+    top_20_idx = np.argsort(abs_diff)[-20:] # Las 20 mejores
+    
+    mean_cas_top = mean_cas_norm[top_20_idx]
+    mean_ncas_top = mean_ncas_norm[top_20_idx]
+    names_top = [FEATURE_NAMES[idx] for idx in top_20_idx]
+
+    y_pos = np.arange(len(top_20_idx))
     bar_height = 0.35
 
-    fig, ax = plt.subplots(figsize=(12, 8))
-    ax.barh(y_pos + bar_height / 2, mean_cas_norm,  bar_height,
+    fig, ax = plt.subplots(figsize=(10, 8))
+    ax.barh(y_pos + bar_height / 2, mean_cas_top,  bar_height,
             color="red",  alpha=0.75, label="CAS")
-    ax.barh(y_pos - bar_height / 2, mean_ncas_norm, bar_height,
+    ax.barh(y_pos - bar_height / 2, mean_ncas_top, bar_height,
             color="blue", alpha=0.75, label="NO CAS")
     ax.set_yticks(y_pos)
-    ax.set_yticklabels(FEATURE_NAMES, fontsize=9)
+    ax.set_yticklabels(names_top, fontsize=9.5)
     ax.set_xlabel("Media normalizada [0, 1]")
-    ax.set_title("Media de cada feature — CAS vs NO CAS")
+    ax.set_title("Media de las 20 features más discriminativas — CAS vs NO CAS")
     ax.legend(loc="lower right")
     ax.set_xlim(0, 1.05)
     plt.tight_layout()
